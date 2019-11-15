@@ -81,6 +81,7 @@ func NewContract(caller ContractRef, object ContractRef, value *big.Int, gas uin
 	return c
 }
 
+// 判断是是否是跳转的目的地
 func (c *Contract) validJumpdest(dest *big.Int) bool {
 	udest := dest.Uint64()
 	// PC cannot go beyond len(code) and certainly can't be bigger than 63bits.
@@ -88,10 +89,14 @@ func (c *Contract) validJumpdest(dest *big.Int) bool {
 	if dest.BitLen() >= 63 || udest >= uint64(len(c.Code)) {
 		return false
 	}
+
 	// Only JUMPDESTs allowed for destinations
+	// 检查目的地的指令值是否为 JUMPDEST
 	if OpCode(c.Code[udest]) != JUMPDEST {
 		return false
 	}
+
+	// 下面的代码都是检查目的地的值是否是指令，而非普通数据
 	// Do we have a contract hash already?
 	if c.CodeHash != (common.Hash{}) {
 		// Does parent context have the analysis?
@@ -108,6 +113,7 @@ func (c *Contract) validJumpdest(dest *big.Int) bool {
 	// in state trie. In that case, we do an analysis, and save it locally, so
 	// we don't have to recalculate it for every JUMP instruction in the execution
 	// However, we don't save it within the parent context
+	// 一般是因为新合约创建、还未将合约写入状态数据库
 	if c.analysis == nil {
 		c.analysis = codeBitmap(c.Code)
 	}

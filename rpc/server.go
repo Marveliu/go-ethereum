@@ -42,6 +42,7 @@ const (
 
 // Server is an RPC server.
 type Server struct {
+	// API 注册信息
 	services serviceRegistry
 	idgen    func() ID
 	run      int32
@@ -108,6 +109,8 @@ func (s *Server) serveSingleRequest(ctx context.Context, codec ServerCodec) {
 		}
 		return
 	}
+
+	// 是否是批处理
 	if batch {
 		h.handleBatch(reqs)
 	} else {

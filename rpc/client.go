@@ -158,6 +158,7 @@ func (op *requestOp) wait(ctx context.Context, c *Client) (*jsonrpcMessage, erro
 // For websocket connections, the origin is set to the local host name.
 //
 // The client reconnects automatically if the connection is lost.
+// 根据参数的路径格式选择不同的连接方法
 func Dial(rawurl string) (*Client, error) {
 	return DialContext(context.Background(), rawurl)
 }

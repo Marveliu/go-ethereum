@@ -242,6 +242,7 @@ func (c *Clique) VerifyHeaders(chain consensus.ChainReader, headers []*types.Hea
 // caller may optionally pass in a batch of parents (ascending order) to avoid
 // looking those up from the database. This is useful for concurrently verifying
 // a batch of new headers.
+// 验证header是否满足共识机制，可以批量的进行验证
 func (c *Clique) verifyHeader(chain consensus.ChainReader, header *types.Header, parents []*types.Header) error {
 	if header.Number == nil {
 		return errUnknownBlock

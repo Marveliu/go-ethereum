@@ -117,6 +117,7 @@ func (n *Notifier) CreateSubscription() *Subscription {
 
 // Notify sends a notification to the client with the given data as payload.
 // If an error occurs the RPC connection is closed and the error is returned.
+// 消息通知
 func (n *Notifier) Notify(id ID, data interface{}) error {
 	enc, err := json.Marshal(data)
 	if err != nil {
@@ -131,6 +132,8 @@ func (n *Notifier) Notify(id ID, data interface{}) error {
 	} else if n.sub.ID != id {
 		panic("Notify with wrong ID")
 	}
+
+	//
 	if n.activated {
 		return n.send(n.sub, enc)
 	}
@@ -156,10 +159,12 @@ func (n *Notifier) takeSubscription() *Subscription {
 // acticate is called after the subscription ID was sent to client. Notifications are
 // buffered before activation. This prevents notifications being sent to the client before
 // the subscription ID is sent to the client.
+// 订阅成功激活，防止订阅过程中发生的消息发送到客户端
 func (n *Notifier) activate() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	// 将buffer里面的消息发送给订阅者
 	for _, data := range n.buffer {
 		if err := n.send(n.sub, data); err != nil {
 			return err
@@ -169,6 +174,7 @@ func (n *Notifier) activate() error {
 	return nil
 }
 
+// 发送消息到客户端
 func (n *Notifier) send(sub *Subscription, data json.RawMessage) error {
 	params, _ := json.Marshal(&subscriptionResult{ID: string(sub.ID), Result: data})
 	ctx := context.Background()

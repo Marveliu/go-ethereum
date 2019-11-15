@@ -86,12 +86,15 @@ type EVMInterpreter struct {
 }
 
 // NewEVMInterpreter returns a new instance of the Interpreter.
+// 构建解释器
 func NewEVMInterpreter(evm *EVM, cfg Config) *EVMInterpreter {
 	// We use the STOP instruction whether to see
 	// the jump table was initialised. If it was not
 	// we'll set the default jump table.
+	// 根据以太坊版本不同，使用不同的JumpTable
 	if !cfg.JumpTable[STOP].valid {
 		var jt JumpTable
+		// 填充Config.JumpTable
 		switch {
 		case evm.chainRules.IsIstanbul:
 			jt = istanbulInstructionSet
@@ -130,7 +133,11 @@ func NewEVMInterpreter(evm *EVM, cfg Config) *EVMInterpreter {
 // It's important to note that any errors returned by the interpreter should be
 // considered a revert-and-consume-all-gas operation except for
 // errExecutionReverted which means revert-and-keep-gas-left.
+// 解释器创建合约代码
+// 负责初始化相关信息，返回存在状态数据库的真正运行的合约代码
 func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
+
+	// big.Int 对象的一个池子，这样可以节省频繁创建和销毁 big.Int 对象的开销。
 	if in.intPool == nil {
 		in.intPool = poolOfIntPools.get()
 		defer func() {
@@ -159,20 +166,29 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		return nil, nil
 	}
 
+	// 程序控制变量
 	var (
-		op    OpCode        // current opcode
-		mem   = NewMemory() // bound memory
-		stack = newstack()  // local stack
+		// 当前操作码
+		op OpCode // current opcode
+		// 执行内存
+		mem = NewMemory() // bound memory
+		// 本地栈
+		stack = newstack() // local stack
 		// For optimisation reason we're using uint64 as the program counter.
 		// It's theoretically possible to go above 2^64. The YP defines the PC
 		// to be uint256. Practically much less so feasible.
-		pc   = uint64(0) // program counter
+		// 程序计数器
+		// 跟踪记录了当前将要执行的指令的位置
+		pc = uint64(0) // program counter
+		// gas 消费
 		cost uint64
 		// copies used by tracer
+		// tracer 需要的复制值
 		pcCopy  uint64 // needed for the deferred Tracer
 		gasCopy uint64 // for Tracer to log gas remaining before execution
 		logged  bool   // deferred Tracer should ignore already logged steps
-		res     []byte // result of the opcode execution function
+		// 操作返回值
+		res []byte // result of the opcode execution function
 	)
 	contract.Input = input
 
@@ -202,18 +218,24 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 
 		// Get the operation from the jump table and validate the stack to ensure there are
 		// enough stack items available to perform the operation.
+		// 通过jumptable，将操作码转化成操作内容
 		op = contract.GetOp(pc)
 		operation := in.cfg.JumpTable[op]
+
+		// 检查指令有效性
 		if !operation.valid {
 			return nil, fmt.Errorf("invalid opcode 0x%x", int(op))
 		}
+
 		// Validate stack
+		// 验证栈的容量是否充足
 		if sLen := stack.len(); sLen < operation.minStack {
 			return nil, fmt.Errorf("stack underflow (%d <=> %d)", sLen, operation.minStack)
 		} else if sLen > operation.maxStack {
 			return nil, fmt.Errorf("stack limit reached %d (%d)", sLen, operation.maxStack)
 		}
 		// If the operation is valid, enforce and write restrictions
+		// 只读模式验证
 		if in.readOnly && in.evm.chainRules.IsByzantium {
 			// If the interpreter is operating in readonly mode, make sure no
 			// state-modifying operation is performed. The 3rd stack item
@@ -225,6 +247,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 			}
 		}
 		// Static portion of gas
+		// gas 静态分配（operation 对应的gas)
 		cost = operation.constantGas // For tracing
 		if !contract.UseGas(operation.constantGas) {
 			return nil, ErrOutOfGas
@@ -235,6 +258,8 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		// the operation
 		// Memory check needs to be done prior to evaluating the dynamic gas portion,
 		// to detect calculation overflows
+		// 如果将要执行的指令需要用到内存存储空间
+		// 计算新分配的内存空间
 		if operation.memorySize != nil {
 			memSize, overflow := operation.memorySize(stack)
 			if overflow {
@@ -249,6 +274,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		// Dynamic portion of gas
 		// consume the gas and return an error if not enough gas is available.
 		// cost is explicitly set so that the capture state defer method can get the proper cost
+		// 动态gas 分配
 		if operation.dynamicGas != nil {
 			var dynamicCost uint64
 			dynamicCost, err = operation.dynamicGas(in.evm, contract, stack, mem, memorySize)
@@ -257,6 +283,8 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 				return nil, ErrOutOfGas
 			}
 		}
+
+		// 重新分配合约执行内存
 		if memorySize > 0 {
 			mem.Resize(memorySize)
 		}
@@ -267,7 +295,9 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		}
 
 		// execute the operation
+		// 执行具体的操作
 		res, err = operation.execute(&pc, in, contract, mem, stack)
+
 		// verifyPool is a build flag. Pool verification makes sure the integrity
 		// of the integer pool by comparing values to a default value.
 		if verifyPool {
@@ -279,6 +309,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 			in.returnData = res
 		}
 
+		// 退出，或向前移动指令指针
 		switch {
 		case err != nil:
 			return nil, err

@@ -641,7 +641,10 @@ func opSstore(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memor
 }
 
 func opJump(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
+	// 从栈中取出一个值，作为跳转的目的地
+	// 这个值其实就是相对于合约代码第0字段的偏移
 	pos := stack.pop()
+	// 判断目的地的第一条指令是 JUMPDEST
 	if !contract.validJumpdest(pos) {
 		return nil, errInvalidJump
 	}

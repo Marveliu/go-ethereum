@@ -38,14 +38,21 @@ var (
 )
 
 type serviceRegistry struct {
-	mu       sync.Mutex
+	mu sync.Mutex
+	// API 列表
 	services map[string]service
 }
 
 // service represents a registered object.
 type service struct {
-	name          string               // name for service
-	callbacks     map[string]*callback // registered handlers
+
+	// 命名空间
+	name string // name for service
+
+	// 从 rpc.API.Service 对象中解析出来的、对象的导出方法的相关信息
+	// 子方法对应的handler
+	callbacks map[string]*callback // registered handlers
+	// 订阅服务，允许客户端订阅某些消息，在有消息时服务端会主动推送这些消息到客户端，而不需要客户端不停的查询
 	subscriptions map[string]*callback // available subscriptions/notifications
 }
 
@@ -59,21 +66,29 @@ type callback struct {
 	isSubscribe bool           // true if this is a subscription callback
 }
 
+// API  注册
 func (r *serviceRegistry) registerName(name string, rcvr interface{}) error {
+
+	// 反射
 	rcvrVal := reflect.ValueOf(rcvr)
+
+	// 检查
 	if name == "" {
 		return fmt.Errorf("no service name for type %s", rcvrVal.Type().String())
 	}
+
 	callbacks := suitableCallbacks(rcvrVal)
 	if len(callbacks) == 0 {
 		return fmt.Errorf("service %T doesn't have any suitable methods/subscriptions to expose", rcvr)
 	}
 
+	// 加锁
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.services == nil {
 		r.services = make(map[string]service)
 	}
+	// 是否存在
 	svc, ok := r.services[name]
 	if !ok {
 		svc = service{
@@ -94,6 +109,7 @@ func (r *serviceRegistry) registerName(name string, rcvr interface{}) error {
 }
 
 // callback returns the callback corresponding to the given RPC method name.
+// 调用注册的方法
 func (r *serviceRegistry) callback(method string) *callback {
 	elem := strings.SplitN(method, serviceMethodSeparator, 2)
 	if len(elem) != 2 {
@@ -114,18 +130,23 @@ func (r *serviceRegistry) subscription(service, name string) *callback {
 // suitableCallbacks iterates over the methods of the given type. It determines if a method
 // satisfies the criteria for a RPC callback or a subscription callback and adds it to the
 // collection of callbacks. See server documentation for a summary of these criteria.
+// 解析对象的方法信息，组装回调或者订阅方法
 func suitableCallbacks(receiver reflect.Value) map[string]*callback {
 	typ := receiver.Type()
 	callbacks := make(map[string]*callback)
+	// 遍历反射的所有方法
 	for m := 0; m < typ.NumMethod(); m++ {
+		// 获得方法的基本信息
 		method := typ.Method(m)
 		if method.PkgPath != "" {
 			continue // method not exported
 		}
+		//
 		cb := newCallback(receiver, method.Func)
 		if cb == nil {
 			continue // function invalid
 		}
+		// 组装name
 		name := formatName(method.Name)
 		callbacks[name] = cb
 	}
@@ -134,11 +155,14 @@ func suitableCallbacks(receiver reflect.Value) map[string]*callback {
 
 // newCallback turns fn (a function) into a callback object. It returns nil if the function
 // is unsuitable as an RPC callback.
+// 将函数转换成回调对象
 func newCallback(receiver, fn reflect.Value) *callback {
 	fntype := fn.Type()
 	c := &callback{fn: fn, rcvr: receiver, errPos: -1, isSubscribe: isPubSub(fntype)}
 	// Determine parameter types. They must all be exported or builtin types.
 	c.makeArgTypes()
+
+	// 判断该方法能否导出
 	if !allExportedOrBuiltin(c.argTypes) {
 		return nil
 	}
@@ -265,6 +289,9 @@ func isSubscriptionType(t reflect.Type) bool {
 
 // isPubSub tests whether the given method has as as first argument a context.Context and
 // returns the pair (Subscription, error).
+// 校验是否是订阅类型
+// 1. 第一个参数必须是context
+// 2. 出参必须要是subscribe
 func isPubSub(methodType reflect.Type) bool {
 	// numIn(0) is the receiver type
 	if methodType.NumIn() < 2 || methodType.NumOut() != 2 {

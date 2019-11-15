@@ -41,6 +41,7 @@ var (
 // A BlockNonce is a 64-bit hash which proves (combined with the
 // mix-hash) that a sufficient amount of computation has been carried
 // out on a block.
+// 用于证明足够的用户对区块进行了证明
 type BlockNonce [8]byte
 
 // EncodeNonce converts the given integer to a block nonce.
@@ -69,21 +70,36 @@ func (n *BlockNonce) UnmarshalText(input []byte) error {
 
 // Header represents a block header in the Ethereum blockchain.
 type Header struct {
-	ParentHash  common.Hash    `json:"parentHash"       gencodec:"required"`
-	UncleHash   common.Hash    `json:"sha3Uncles"       gencodec:"required"`
-	Coinbase    common.Address `json:"miner"            gencodec:"required"`
-	Root        common.Hash    `json:"stateRoot"        gencodec:"required"`
-	TxHash      common.Hash    `json:"transactionsRoot" gencodec:"required"`
-	ReceiptHash common.Hash    `json:"receiptsRoot"     gencodec:"required"`
-	Bloom       Bloom          `json:"logsBloom"        gencodec:"required"`
-	Difficulty  *big.Int       `json:"difficulty"       gencodec:"required"`
-	Number      *big.Int       `json:"number"           gencodec:"required"`
-	GasLimit    uint64         `json:"gasLimit"         gencodec:"required"`
-	GasUsed     uint64         `json:"gasUsed"          gencodec:"required"`
-	Time        uint64         `json:"timestamp"        gencodec:"required"`
-	Extra       []byte         `json:"extraData"        gencodec:"required"`
-	MixDigest   common.Hash    `json:"mixHash"`
-	Nonce       BlockNonce     `json:"nonce"`
+	// 父区块hash
+	ParentHash common.Hash `json:"parentHash"       gencodec:"required"`
+	// 所有叔区块hash
+	UncleHash common.Hash `json:"sha3Uncles"       gencodec:"required"`
+	// 接受出块奖励的地址。矿工出块时在这个字段填入自己的地址。
+	Coinbase common.Address `json:"miner"            gencodec:"required"`
+	// 此区块包含的所有交易完成后，state对象的哈希值
+	Root common.Hash `json:"stateRoot"        gencodec:"required"`
+	// 此区块包含的所有交易的哈希(Block.transactions)
+	TxHash common.Hash `json:"transactionsRoot" gencodec:"required"`
+	// 此区块所有交易完成后所产生的所有收据的哈希
+	ReceiptHash common.Hash `json:"receiptsRoot"     gencodec:"required"`
+	// 布隆过滤对象，用来查找交易产生的Log
+	Bloom Bloom `json:"logsBloom"        gencodec:"required"`
+	// 此区块的难度值
+	Difficulty *big.Int `json:"difficulty"       gencodec:"required"`
+	// 此区块的高度
+	Number *big.Int `json:"number"           gencodec:"required"`
+	// 此区块所有交易消耗的gas值的上限
+	GasLimit uint64 `json:"gasLimit"         gencodec:"required"`
+	// 此区块所有交易消耗的gas的实际值
+	GasUsed uint64 `json:"gasUsed"          gencodec:"required"`
+	// 区块时间戳
+	Time uint64 `json:"timestamp"        gencodec:"required"`
+	// 区块额外数据
+	Extra []byte `json:"extraData"        gencodec:"required"`
+	// 以太坊hashimoto算法产生的哈希
+	MixDigest common.Hash `json:"mixHash"`
+	// PoW共识挖矿时通过随意此字段，使区块哈希发生变化从而产生符合Difficulty值要求的区块哈希
+	Nonce BlockNonce `json:"nonce"`
 }
 
 // field type overrides for gencodec
@@ -146,20 +162,26 @@ type Body struct {
 
 // Block represents an entire block in the Ethereum blockchain.
 type Block struct {
-	header       *Header
-	uncles       []*Header
+	// 区块头
+	header *Header
+	// 当前块包含的叔块
+	uncles []*Header
+	// 当前块包含的所有交易
 	transactions Transactions
 
 	// caches
+	// 缓存
 	hash atomic.Value
 	size atomic.Value
 
 	// Td is used by package core to store the total difficulty
 	// of the chain up to and including the block.
+	// 存储总难度
 	td *big.Int
 
 	// These fields are used by package eth to track
 	// inter-peer block relay.
+	// 用于记录块之间的转发
 	ReceivedAt   time.Time
 	ReceivedFrom interface{}
 }
@@ -200,6 +222,7 @@ type storageblock struct {
 // The values of TxHash, UncleHash, ReceiptHash and Bloom in header
 // are ignored and set to values derived from the given txs, uncles
 // and receipts.
+// 基于复制的的方式（不可变)构建区块
 func NewBlock(header *Header, txs []*Transaction, uncles []*Header, receipts []*Receipt) *Block {
 	b := &Block{header: CopyHeader(header), td: new(big.Int)}
 

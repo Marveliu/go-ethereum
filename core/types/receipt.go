@@ -278,6 +278,7 @@ func decodeV3StoredReceiptRLP(r *ReceiptForStorage, blob []byte) error {
 }
 
 // Receipts is a wrapper around a Receipt array to implement DerivableList.
+// 对receipt数组的包装，用于实现derivableList
 type Receipts []*Receipt
 
 // Len returns the number of receipts in this list.

@@ -204,16 +204,22 @@ func (api *PublicFilterAPI) NewBlockFilter() rpc.ID {
 }
 
 // NewHeads send a notification each time a new (header) block is appended to the chain.
+// 发布区块加入的消息
 func (api *PublicFilterAPI) NewHeads(ctx context.Context) (*rpc.Subscription, error) {
+
+	// 获得被通知者
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
 		return &rpc.Subscription{}, rpc.ErrNotificationsUnsupported
 	}
 
+	// 生成订阅对象
 	rpcSub := notifier.CreateSubscription()
 
+	// 创建一个 goroutine，用来不停地监听 header 创建的消
 	go func() {
 		headers := make(chan *types.Header)
+		// 订阅系统消息
 		headersSub := api.events.SubscribeNewHeads(headers)
 
 		for {

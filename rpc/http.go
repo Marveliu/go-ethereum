@@ -302,6 +302,8 @@ func newCorsHandler(srv http.Handler, allowedOrigins []string) http.Handler {
 	if len(allowedOrigins) == 0 {
 		return srv
 	}
+
+	// 使用 cors 库创建Http handler
 	c := cors.New(cors.Options{
 		AllowedOrigins: allowedOrigins,
 		AllowedMethods: []string{http.MethodPost, http.MethodGet},
@@ -322,11 +324,15 @@ type virtualHostHandler struct {
 
 // ServeHTTP serves JSON-RPC requests over HTTP, implements http.Handler
 func (h *virtualHostHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+
+	// 判断是否使用域名
 	// if r.Host is not set, we can continue serving since a browser would set the Host header
 	if r.Host == "" {
 		h.next.ServeHTTP(w, r)
 		return
 	}
+
+	// ip + port
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
 		// Either invalid (too many colons) or no port specified
@@ -339,10 +345,12 @@ func (h *virtualHostHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	}
 	// Not an ip address, but a hostname. Need to validate
+	// * 则不关心使用的域名
 	if _, exist := h.vhosts["*"]; exist {
 		h.next.ServeHTTP(w, r)
 		return
 	}
+	// 校验域名是否为我们设置的
 	if _, exist := h.vhosts[host]; exist {
 		h.next.ServeHTTP(w, r)
 		return

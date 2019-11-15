@@ -30,6 +30,7 @@ import (
 )
 
 // ReadCanonicalHash retrieves the hash assigned to a canonical block number.
+// 通过区块号获得对应的hash地址
 func ReadCanonicalHash(db ethdb.Reader, number uint64) common.Hash {
 	data, _ := db.Ancient(freezerHashTable, number)
 	if len(data) == 0 {

@@ -185,6 +185,8 @@ func (st *StateTransition) preCheck() error {
 // returning the result including the used gas. It returns an error if failed.
 // An error indicates a consensus issue.
 func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) {
+
+	// 检查
 	if err = st.preCheck(); err != nil {
 		return
 	}
@@ -192,6 +194,8 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 	sender := vm.AccountRef(msg.From())
 	homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber)
 	istanbul := st.evm.ChainConfig().IsIstanbul(st.evm.BlockNumber)
+
+	// 判断是否创建新合约
 	contractCreation := msg.To() == nil
 
 	// Pay intrinsic gas
@@ -211,9 +215,11 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 		vmerr error
 	)
 	if contractCreation {
+		// 调用 EVM.Create 创建合约
 		ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value)
 	} else {
 		// Increment the nonce for the next transaction
+		// 不是创建合约，则调用 EVM.Call 调用合约
 		st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1)
 		ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value)
 	}
@@ -226,6 +232,8 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 			return nil, 0, false, vmerr
 		}
 	}
+
+	// 归还剩余的 gas，并将已消耗的 gas 计入矿工账户中
 	st.refundGas()
 	st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice))
 

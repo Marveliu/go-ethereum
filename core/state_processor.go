@@ -85,17 +85,26 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 // and uses the input parameters for its environment. It returns the receipt
 // for the transaction, gas used and an error if the transaction failed,
 // indicating the block was invalid.
+// 将交易的信息记录到以太坊状态数据库（state.StateDB）
+// 这其中包括转账信息和执行合约信息（如果交易中有合约的话）
 func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, error) {
+
+	// Transaction 对象转换成 Message
 	msg, err := tx.AsMessage(types.MakeSigner(config, header.Number))
 	if err != nil {
 		return nil, err
 	}
 	// Create a new context to be used in the EVM environment
+	// 构建EVM上下文，提供访问当前区块链数据的方法
 	context := NewEVMContext(msg, header, bc, author)
+
 	// Create a new environment which holds all relevant information
 	// about the transaction and calling mechanisms.
+	// 创建虚拟机
 	vmenv := vm.NewEVM(context, statedb, config, cfg)
+
 	// Apply the transaction to the current state (included in the env)
+	// 执行交易
 	_, gas, failed, err := ApplyMessage(vmenv, msg, gp)
 	if err != nil {
 		return nil, err

@@ -100,9 +100,13 @@ func (s *stateObject) empty() bool {
 // Account is the Ethereum consensus representation of accounts.
 // These objects are stored in the main account trie.
 type Account struct {
-	Nonce    uint64
-	Balance  *big.Int
-	Root     common.Hash // merkle root of the storage trie
+	// 账户操作编号
+	Nonce uint64
+	// 账户余额
+	Balance *big.Int
+	// 数据存储 trie 哈希的 Root
+	Root common.Hash // merkle root of the storage trie
+	// 合约代码hash
 	CodeHash []byte
 }
 
@@ -357,6 +361,7 @@ func (s *stateObject) SubBalance(amount *big.Int) {
 }
 
 func (s *stateObject) SetBalance(amount *big.Int) {
+	// 构造 SetBalance 的回滚操作 balanceChange 并加其记录到 `journal.entries` 中
 	s.db.journal.append(balanceChange{
 		account: &s.address,
 		prev:    new(big.Int).Set(s.data.Balance),

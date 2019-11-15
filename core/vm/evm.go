@@ -41,7 +41,10 @@ type (
 )
 
 // run runs the given contract and takes care of running precompiles with a fallback to the byte code interpreter.
+// 复杂合约的创建和调用
 func run(evm *EVM, contract *Contract, input []byte, readOnly bool) ([]byte, error) {
+	// 判断合约是预定义合约
+	// 不使用解释器
 	if contract.CodeAddr != nil {
 		precompiles := PrecompiledContractsHomestead
 		if evm.chainRules.IsByzantium {
@@ -50,10 +53,12 @@ func run(evm *EVM, contract *Contract, input []byte, readOnly bool) ([]byte, err
 		if evm.chainRules.IsIstanbul {
 			precompiles = PrecompiledContractsIstanbul
 		}
+		// 如果是，则执行对应的对象
 		if p := precompiles[*contract.CodeAddr]; p != nil {
 			return RunPrecompiledContract(p, input, contract)
 		}
 	}
+	// 选择可以运行的解释器，运行当前的合约并返回
 	for _, interpreter := range evm.interpreters {
 		if interpreter.CanRun(contract.Code) {
 			if evm.interpreter != interpreter {
@@ -134,9 +139,13 @@ type EVM struct {
 // only ever be used *once*.
 func NewEVM(ctx Context, statedb StateDB, chainConfig *params.ChainConfig, vmConfig Config) *EVM {
 	evm := &EVM{
-		Context:      ctx,
-		StateDB:      statedb,
-		vmConfig:     vmConfig,
+		// 提供访问当前区块链数据和挖矿环境的函数和数据
+		Context: ctx,
+		// 以太坊状态数据库对象
+		StateDB: statedb,
+		// 虚拟机配置信息
+		vmConfig: vmConfig,
+		// 当前节点的区块链配置信息
 		chainConfig:  chainConfig,
 		chainRules:   chainConfig.Rules(ctx.BlockNumber),
 		interpreters: make([]Interpreter, 0, 1),
@@ -160,6 +169,7 @@ func NewEVM(ctx Context, statedb StateDB, chainConfig *params.ChainConfig, vmCon
 
 	// vmConfig.EVMInterpreter will be used by EVM-C, it won't be checked here
 	// as we always want to have the built-in EVM as the failover option.
+	// 创建解释器对象
 	evm.interpreters = append(evm.interpreters, NewEVMInterpreter(evm, vmConfig))
 	evm.interpreter = evm.interpreters[0]
 
@@ -186,6 +196,8 @@ func (evm *EVM) Interpreter() Interpreter {
 // parameters. It also handles any necessary value transfer required and takes
 // the necessary steps to create accounts and reverses the state in case of an
 // execution error or failed value transfer.
+// 调用合约
+// input 参数，是调用合约的public方法的参数
 func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) {
 	if evm.vmConfig.NoRecursion && evm.depth > 0 {
 		return nil, gas, nil
@@ -204,6 +216,10 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 		to       = AccountRef(addr)
 		snapshot = evm.StateDB.Snapshot()
 	)
+
+	// 判断合约地址是否存在
+	// 一般情况下，被调用的合约地址应该存在以太坊状态数据库中（合约创建成功)
+	// 例外情况，被调用合约地址是预先定义的情况
 	if !evm.StateDB.Exist(addr) {
 		precompiles := PrecompiledContractsHomestead
 		if evm.chainRules.IsByzantium {
@@ -222,10 +238,12 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 		}
 		evm.StateDB.CreateAccount(addr)
 	}
+	// 使用当前的信息创建一个合约对象
 	evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value)
 	// Initialise a new contract and set the code that is to be used by the EVM.
 	// The contract is a scoped environment for this execution context only.
 	contract := NewContract(caller, to, value, gas)
+	// 从状态数据库中获取合约的代码，填充到合约对象中
 	contract.SetCallCode(&addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
 
 	// Even if the account has no code, we need to continue because it might be a precompile
@@ -260,6 +278,7 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 //
 // CallCode differs from Call in the sense that it executes the given address'
 // code with the caller as context.
+// 执行合约，修改被调用合约的本身地址
 func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) {
 	if evm.vmConfig.NoRecursion && evm.depth > 0 {
 		return nil, gas, nil
@@ -274,6 +293,7 @@ func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, 
 		return nil, gas, ErrInsufficientBalance
 	}
 
+	// 利用现有的数据生成合约对象，将合约对象的地址 to 设置成调用者的，也就是caller
 	var (
 		snapshot = evm.StateDB.Snapshot()
 		to       = AccountRef(caller.Address())
@@ -281,6 +301,7 @@ func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, 
 	// Initialise a new contract and set the code that is to be used by the EVM.
 	// The contract is a scoped environment for this execution context only.
 	contract := NewContract(caller, to, value, gas)
+	// 设置合约的执行代码
 	contract.SetCallCode(&addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
 
 	ret, err = run(evm, contract, input, false)
@@ -298,6 +319,7 @@ func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, 
 //
 // DelegateCall differs from CallCode in the sense that it executes the given address'
 // code with the caller as context and the caller is set to the caller of the caller.
+// 执行合约代码，会修改合约调用者和合约本身的地址
 func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
 	if evm.vmConfig.NoRecursion && evm.depth > 0 {
 		return nil, gas, nil
@@ -309,10 +331,12 @@ func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []by
 
 	var (
 		snapshot = evm.StateDB.Snapshot()
-		to       = AccountRef(caller.Address())
+		// 调用者设置成caller，为了修改被调用合约的自身地址
+		to = AccountRef(caller.Address())
 	)
 
 	// Initialise a new contract and make initialise the delegate values
+	// AsDelegate 将合约的调用地址设置成目前调用者的
 	contract := NewContract(caller, to, nil, gas).AsDelegate()
 	contract.SetCallCode(&addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
 
@@ -330,6 +354,7 @@ func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []by
 // as parameters while disallowing any modifications to the state during the call.
 // Opcodes that attempt to perform such modifications will result in exceptions
 // instead of performing the modifications.
+// 执行合约，不运行执行修改永久存储数据的命令
 func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
 	if evm.vmConfig.NoRecursion && evm.depth > 0 {
 		return nil, gas, nil
@@ -380,36 +405,50 @@ func (c *codeAndHash) Hash() common.Hash {
 }
 
 // create creates a new contract using code as deployment code.
+// 创建合约
 func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64, value *big.Int, address common.Address) ([]byte, common.Address, uint64, error) {
 	// Depth check execution. Fail if we're trying to execute above the
 	// limit.
+	// 检查合约创建的递归调用次数
+	// solidity 语言中允许在合约中通过New关键字调用新的合约
 	if evm.depth > int(params.CallCreateDepth) {
 		return nil, common.Address{}, gas, ErrDepth
 	}
+	// 检查合约的创建者是否有足够的以太币
 	if !evm.CanTransfer(evm.StateDB, caller.Address(), value) {
 		return nil, common.Address{}, gas, ErrInsufficientBalance
 	}
+
+	// 增加合约者的Nonce值
 	nonce := evm.StateDB.GetNonce(caller.Address())
 	evm.StateDB.SetNonce(caller.Address(), nonce+1)
 
 	// Ensure there's no existing contract already at the designated address
+	// 校验防止已经生成了合约地址
 	contractHash := evm.StateDB.GetCodeHash(address)
 	if evm.StateDB.GetNonce(address) != 0 || (contractHash != (common.Hash{}) && contractHash != emptyCodeHash) {
 		return nil, common.Address{}, 0, ErrContractAddressCollision
 	}
+
 	// Create a new account on the state
+	// 镜像
 	snapshot := evm.StateDB.Snapshot()
+	// 创建新的合约账户
 	evm.StateDB.CreateAccount(address)
 	if evm.chainRules.IsEIP158 {
 		evm.StateDB.SetNonce(address, 1)
 	}
+	// 调用者向合约账号转以太币
 	evm.Transfer(evm.StateDB, caller.Address(), address, value)
 
 	// Initialise a new contract and set the code that is to be used by the EVM.
 	// The contract is a scoped environment for this execution context only.
+	// 构建contract对象包含和维护了合约在执行过程中的必要信息
+	// 比如合约创建者、合约自身地址、合约剩余 gas、合约代码和代码的 jumpdests 记录
 	contract := NewContract(caller, AccountRef(address), value, gas)
 	contract.SetCodeOptionalHash(&address, codeAndHash)
 
+	// 递归调用检查
 	if evm.vmConfig.NoRecursion && evm.depth > 0 {
 		return nil, address, gas, nil
 	}
@@ -418,17 +457,21 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 		evm.vmConfig.Tracer.CaptureStart(caller.Address(), address, true, codeAndHash.code, gas, value)
 	}
 	start := time.Now()
-
+	// 合约创建
 	ret, err := run(evm, contract, nil, false)
 
 	// check whether the max code size has been exceeded
 	maxCodeSizeExceeded := evm.chainRules.IsEIP158 && len(ret) > params.MaxCodeSize
+
 	// if the contract creation ran successfully and no errors were returned
 	// calculate the gas required to store the code. If the code could not
 	// be stored due to not enough gas set an error and let it be handled
 	// by the error checking condition below.
+	// 如果运行成功并且合约代码没有超过长度的限制
+	// 则调用stateDB.setCode将执行后的合约代码存储到以太坊状态数据库的合约账户中
 	if err == nil && !maxCodeSizeExceeded {
 		createDataGas := uint64(len(ret)) * params.CreateDataGas
+		// 合约创建成功，将合约保存到 StateDB 之前，先 useGas
 		if contract.UseGas(createDataGas) {
 			evm.StateDB.SetCode(address, ret)
 		} else {
@@ -457,7 +500,9 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 }
 
 // Create creates a new contract using code as deployment code.
+// 创建合约
 func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+	// 通过当前合约创建者地址和其账户的Nonce值计算出地址值作为合约地址
 	contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address()))
 	return evm.create(caller, &codeAndHash{code: code}, gas, value, contractAddr)
 }

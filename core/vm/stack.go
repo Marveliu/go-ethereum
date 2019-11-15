@@ -25,6 +25,7 @@ import (
 // expected to be changed and modified. stack does not take care of adding newly
 // initialised objects.
 type Stack struct {
+	// 变长数组
 	data []*big.Int
 }
 

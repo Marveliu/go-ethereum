@@ -33,9 +33,12 @@ var errGasUintOverflow = errors.New("gas uint64 overflow")
 
 type operation struct {
 	// execute is the operation function
-	execute     executionFunc
+	// 指令的解释执行函数
+	execute executionFunc
+	// 固定gas
 	constantGas uint64
-	dynamicGas  gasFunc
+	// 计算指令需要消耗的gas
+	dynamicGas gasFunc
 	// minStack tells how many stack items are required
 	minStack int
 	// maxStack specifies the max length the stack can have for this operation
@@ -43,13 +46,20 @@ type operation struct {
 	maxStack int
 
 	// memorySize returns the memory size required for the operation
+	// 计算指令将要消耗的内存存储空间大小的函数
 	memorySize memorySizeFunc
 
-	halts   bool // indicates whether the operation should halt further execution
-	jumps   bool // indicates whether the program counter should not increment
-	writes  bool // determines whether this a state modifying operation
-	valid   bool // indication whether the retrieved operation is valid and known
+	// 指令执行完成后是否停止解释器
+	halts bool // indicates whether the operation should halt further execution
+	// 是否跳转指令
+	jumps bool // indicates whether the program counter should not increment
+	// 是否是写指令
+	writes bool // determines whether this a state modifying operation
+	// 是否是有效指令
+	valid bool // indication whether the retrieved operation is valid and known
+	// 指令执行完是否中断执行并恢复状态数据库
 	reverts bool // determines whether the operation reverts state (implicitly halts)
+	// 指令是否有返回值
 	returns bool // determines whether the operations sets the return data content
 }
 

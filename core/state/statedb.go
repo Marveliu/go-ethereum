@@ -90,8 +90,12 @@ type StateDB struct {
 
 	// Journal of state modifications. This is the backbone of
 	// Snapshot and RevertToSnapshot.
-	journal        *journal
+
+	// 记录
+	journal *journal
+	// 有效快照信息
 	validRevisions []revision
+	// 生成有效快照ID
 	nextRevisionId int
 
 	// Measurements gathered during execution for debugging purposes
@@ -627,6 +631,7 @@ func (self *StateDB) Copy() *StateDB {
 }
 
 // Snapshot returns an identifier for the current revision of the state.
+// 创建快照，返回快照ID
 func (self *StateDB) Snapshot() int {
 	id := self.nextRevisionId
 	self.nextRevisionId++
@@ -635,6 +640,7 @@ func (self *StateDB) Snapshot() int {
 }
 
 // RevertToSnapshot reverts all state changes made since the given revision.
+// 从某快照进行恢复
 func (self *StateDB) RevertToSnapshot(revid int) {
 	// Find the snapshot in the stack of valid snapshots.
 	idx := sort.Search(len(self.validRevisions), func(i int) bool {

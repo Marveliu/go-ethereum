@@ -29,6 +29,8 @@ type DerivableList interface {
 	GetRlp(i int) []byte
 }
 
+// 计算Hash
+// 本质上是构建trie，然后计算根节点的Hash值
 func DeriveSha(list DerivableList) common.Hash {
 	keybuf := new(bytes.Buffer)
 	trie := new(trie.Trie)

@@ -47,6 +47,9 @@ func StartHTTPEndpoint(endpoint string, apis []API, modules []string, cors []str
 	if listener, err = net.Listen("tcp", endpoint); err != nil {
 		return nil, nil, err
 	}
+
+	// vhost 防止同源攻击
+	// Cors 跨域请求
 	go NewHTTPServer(cors, vhosts, timeouts, handler).Serve(listener)
 	return listener, handler, err
 }

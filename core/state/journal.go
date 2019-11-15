@@ -26,9 +26,11 @@ import (
 // reverted on demand.
 type journalEntry interface {
 	// revert undoes the changes introduced by this journal entry.
+	// 恢复方法, 对操作进行回滚
 	revert(*StateDB)
 
 	// dirtied returns the Ethereum address modified by this journal entry.
+	// 本次记录修改的以太坊账号
 	dirtied() *common.Address
 }
 
