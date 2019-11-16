@@ -37,6 +37,7 @@ type fileCache struct {
 
 // scan performs a new scan on the given directory, compares against the already
 // cached filenames, and returns file sets: creates, deletes, updates.
+// 文件扫描，发现哪些变化的文件
 func (fc *fileCache) scan(keyDir string) (mapset.Set, mapset.Set, mapset.Set, error) {
 	t0 := time.Now()
 
@@ -65,6 +66,7 @@ func (fc *fileCache) scan(keyDir string) (mapset.Set, mapset.Set, mapset.Set, er
 		// Gather the set of all and fresly modified files
 		all.Add(path)
 
+		// 扫描所有修改的文件
 		modified := fi.ModTime()
 		if modified.After(fc.lastMod) {
 			mods.Add(path)
@@ -76,6 +78,7 @@ func (fc *fileCache) scan(keyDir string) (mapset.Set, mapset.Set, mapset.Set, er
 	t2 := time.Now()
 
 	// Update the tracked files and return the three sets
+	// 更新所有的文件状态
 	deletes := fc.all.Difference(all)   // Deletes = previous - current
 	creates := all.Difference(fc.all)   // Creates = current - previous
 	updates := mods.Difference(creates) // Updates = modified - creates

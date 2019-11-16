@@ -36,8 +36,10 @@ import (
 // As such, these URLs should not be used outside of the scope of an Ethereum
 // wallet or account.
 type URL struct {
+	// 账户文件类型
 	Scheme string // Protocol scheme to identify a capable account backend
-	Path   string // Path for the backend to identify a unique entity
+	// 账户文件地址
+	Path string // Path for the backend to identify a unique entity
 }
 
 // parseURL converts a user supplied URL into the accounts specific structure.

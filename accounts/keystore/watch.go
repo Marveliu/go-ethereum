@@ -25,6 +25,7 @@ import (
 	"github.com/rjeczalik/notify"
 )
 
+// 监控系统上文件的变化，用于实时的更新账户文件
 type watcher struct {
 	ac       *accountCache
 	starting bool
@@ -49,6 +50,7 @@ func (w *watcher) start() {
 		return
 	}
 	w.starting = true
+	// 启动协程，进行监控
 	go w.loop()
 }
 

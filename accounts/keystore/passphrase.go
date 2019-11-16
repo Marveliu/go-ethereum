@@ -80,6 +80,7 @@ type keyStorePassphrase struct {
 	skipKeyFileVerification bool
 }
 
+//
 func (ks keyStorePassphrase) GetKey(addr common.Address, filename, auth string) (*Key, error) {
 	// Load the key from the keystore and decrypt its contents
 	keyjson, err := ioutil.ReadFile(filename)
@@ -98,23 +99,33 @@ func (ks keyStorePassphrase) GetKey(addr common.Address, filename, auth string) 
 }
 
 // StoreKey generates a key, encrypts with 'auth' and stores in the given directory
+// 生成并且存储秘钥
 func StoreKey(dir, auth string, scryptN, scryptP int) (accounts.Account, error) {
 	_, a, err := storeNewKey(&keyStorePassphrase{dir, scryptN, scryptP, false}, rand.Reader, auth)
 	return a, err
 }
 
 func (ks keyStorePassphrase) StoreKey(filename string, key *Key, auth string) error {
+	// 基于password，scryptN, scryptP使用scrypt函数生成加密KEY
+	// 然后用这个加密KEY用AES算法对账户私钥key.D进行加密，写入keystore文件的crypto字段中。
+	// 因为以太坊用的ECDSA的公私钥都仅依赖于D参数，只要能拿到这个D，就能推算出公私钥
+	// 推算方法见crypto/crypto.go中的ToECDSAUnsafe()函数
+	// 日后使用password可以解密keystore文件获取私钥
+	// 因为scryptN, scryptP都明文写在了crypto.kdfparams.n, crypto.kdfparams.p中。
 	keyjson, err := EncryptKey(key, auth, ks.scryptN, ks.scryptP)
 	if err != nil {
 		return err
 	}
 	// Write into temporary file
+	// 写入临时文件
 	tmpName, err := writeTemporaryKeyFile(filename, keyjson)
 	if err != nil {
 		return err
 	}
+
 	if !ks.skipKeyFileVerification {
 		// Verify that we can decrypt the file with the given password.
+		// 验证一下密码是否可以使用当前秘钥
 		_, err = ks.GetKey(key.Address, tmpName, auth)
 		if err != nil {
 			msg := "An error was encountered when saving and verifying the keystore file. \n" +

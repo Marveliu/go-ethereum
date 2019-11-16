@@ -230,6 +230,7 @@ func (ac *accountCache) close() {
 
 // scanAccounts checks if any changes have occurred on the filesystem, and
 // updates the account cache accordingly
+// 检查文件的变化，更新对应的文件信息
 func (ac *accountCache) scanAccounts() error {
 	// Scan the entire folder metadata for file changes
 	creates, deletes, updates, err := ac.fileC.scan(ac.keydir)
@@ -241,6 +242,7 @@ func (ac *accountCache) scanAccounts() error {
 		return nil
 	}
 	// Create a helper method to scan the contents of the key files
+	// 从keyStore中获得对应的账号信息
 	var (
 		buf = new(bufio.Reader)
 		key struct {

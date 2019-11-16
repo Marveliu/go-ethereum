@@ -209,8 +209,13 @@ func ValidateSignatureValues(v byte, r, s *big.Int, homestead bool) bool {
 	return r.Cmp(secp256k1N) < 0 && s.Cmp(secp256k1N) < 0 && (v == 0 || v == 1)
 }
 
+// 通过公钥生成地址
 func PubkeyToAddress(p ecdsa.PublicKey) common.Address {
 	pubBytes := FromECDSAPub(&p)
+	// BytesToAddress会将传入的[]byte b赋值给[20]byte a，作为账户地址
+	// 赋值规则如下：
+	// 1. 若len(b) > 20，则将最后20个字节复制更新a
+	// 2. 否则，将b的所有字节复制更新a的尾部部分。
 	return common.BytesToAddress(Keccak256(pubBytes[1:])[12:])
 }
 

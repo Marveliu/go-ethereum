@@ -130,8 +130,11 @@ func (k *Key) UnmarshalJSON(j []byte) (err error) {
 func newKeyFromECDSA(privateKeyECDSA *ecdsa.PrivateKey) *Key {
 	id := uuid.NewRandom()
 	key := &Key{
-		Id:         id,
-		Address:    crypto.PubkeyToAddress(privateKeyECDSA.PublicKey),
+		Id: id,
+		// 公钥推导出地址
+		Address: crypto.PubkeyToAddress(privateKeyECDSA.PublicKey),
+		// 只存私钥，因为地址和公钥都能从私钥获取到。
+		// 而且这里总是存的私钥明文。
 		PrivateKey: privateKeyECDSA,
 	}
 	return key
@@ -159,22 +162,31 @@ func NewKeyForDirectICAP(rand io.Reader) *Key {
 }
 
 func newKey(rand io.Reader) (*Key, error) {
+	// 基于随机数创建私钥，这个私钥是个结构体，包含了公钥
 	privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand)
 	if err != nil {
 		return nil, err
 	}
+	// 基于私钥生成Key结构体
+	// 结构体包含私钥，账户地址，uuid
 	return newKeyFromECDSA(privateKeyECDSA), nil
 }
 
 func storeNewKey(ks keyStore, rand io.Reader, auth string) (*Key, accounts.Account, error) {
+	// 生成私钥和账户地址
 	key, err := newKey(rand)
 	if err != nil {
 		return nil, accounts.Account{}, err
 	}
+	// 基于创建的密钥，构建完整的Account对象
+	// keyFileName用来生成keystore文件名：UTC--当前时间--生成的账户地址
+	// Scheme：这里的账号后端协议模式都是"keystore"
+	// Scheme目前查到可取的值有ledger, trezor, keystore
 	a := accounts.Account{
 		Address: key.Address,
 		URL:     accounts.URL{Scheme: KeyStoreScheme, Path: ks.JoinPath(keyFileName(key.Address))},
 	}
+	// 加密密钥并写入keystore文件
 	if err := ks.StoreKey(a.URL.Path, key, auth); err != nil {
 		zeroKey(key.PrivateKey)
 		return nil, a, err

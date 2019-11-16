@@ -290,23 +290,39 @@ func ambiguousAddrRecovery(ks *keystore.KeyStore, err *keystore.AmbiguousAddrErr
 }
 
 // accountCreate creates a new account into the keystore defined by the CLI flags.
+// 创建账号
 func accountCreate(ctx *cli.Context) error {
+	// 获得当前节点的配置信息
 	cfg := gethConfig{Node: defaultNodeConfig()}
 	// Load config file.
+	// 如果命令行指定了--config并且对应文件能找到，则读取config文件更新cfg
 	if file := ctx.GlobalString(configFileFlag.Name); file != "" {
 		if err := loadConfig(file, &cfg); err != nil {
 			utils.Fatalf("%v", err)
 		}
 	}
+	// 使用命令行传入的参数更新节点相关的配置信息
+	// 比如上面我们指定了--datadir，那么就在这一步更新到节点配置中
 	utils.SetNodeConfig(ctx, &cfg.Node)
+
+	// 根据命令行的--lightkdf确定scrypt算法的参数，和keystore文件的存储目录
+	// scrypt：内存密集的密钥生成函数（KDF）
+	// 参见：https://tools.ietf.org/html/rfc7914
 	scryptN, scryptP, keydir, err := cfg.Node.AccountConfig()
 
 	if err != nil {
 		utils.Fatalf("Failed to read configuration: %v", err)
 	}
 
+	// 获得密码
+	// MakePasswordList可以读取--password指定的文件内容
+	// 文件内容按\n分隔，每一行内容再去掉尾部的\r
+	// 以此作为密码列表passwordList
+	// getPassPhrase传入的0，表示取passwordList[0]作为这个账号的密码（如果passwordList有内容的话）
+	// 传入true，表示如果是命令行输入密码，则需要重复确认一次，如果不一致，则创建账户直接失败。
 	password := getPassPhrase("Your new account is locked with a password. Please give a password. Do not forget this password.", true, 0, utils.MakePasswordList(ctx))
 
+	// 生成账号
 	account, err := keystore.StoreKey(keydir, password, scryptN, scryptP)
 
 	if err != nil {
