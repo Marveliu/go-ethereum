@@ -48,6 +48,7 @@ var (
 
 // Seal implements consensus.Engine, attempting to find a nonce that satisfies
 // the block's difficulty requirements.
+// 创建多线程同时挖矿，然后等待结果
 func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
 	// If we're running a fake PoW, simply return a 0 nonce immediately
 	if ethash.config.PowMode == ModeFake || ethash.config.PowMode == ModeFullFake {
@@ -85,6 +86,7 @@ func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, resu
 		threads = 0 // Allows disabling local mining without extra logic around local/remote
 	}
 	// Push new work to remote sealer
+	// 多节点远程挖矿
 	if ethash.workCh != nil {
 		ethash.workCh <- &sealTask{block: block, results: results}
 	}
@@ -96,6 +98,7 @@ func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, resu
 		pend.Add(1)
 		go func(id int, nonce uint64) {
 			defer pend.Done()
+			// 具体挖矿方法
 			ethash.mine(block, id, nonce, abort, locals)
 		}(i, uint64(ethash.rand.Int63()))
 	}
@@ -129,6 +132,7 @@ func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, resu
 
 // mine is the actual proof-of-work miner that searches for a nonce starting from
 // seed that results in correct final block difficulty.
+//
 func (ethash *Ethash) mine(block *types.Block, id int, seed uint64, abort chan struct{}, found chan *types.Block) {
 	// Extract some data from the header
 	var (
@@ -150,6 +154,7 @@ search:
 		select {
 		case <-abort:
 			// Mining terminated, update stats and abort
+			// 终止
 			logger.Trace("Ethash nonce search aborted", "attempts", nonce-seed)
 			ethash.hashrate.Mark(attempts)
 			break search
@@ -157,11 +162,13 @@ search:
 		default:
 			// We don't have to update hash rate on every nonce, so update after after 2^X nonces
 			attempts++
+			// 每隔 1<<15 统计一次hashrate
 			if (attempts % (1 << 15)) == 0 {
 				ethash.hashrate.Mark(attempts)
 				attempts = 0
 			}
 			// Compute the PoW value of this nonce
+			// 计算本次工作量证明的值
 			digest, result := hashimotoFull(dataset.dataset, hash, nonce)
 			if new(big.Int).SetBytes(result).Cmp(target) <= 0 {
 				// Correct nonce found, create a new header with it
@@ -178,6 +185,7 @@ search:
 				}
 				break search
 			}
+			// nonce 变量每次都会加1
 			nonce++
 		}
 	}
@@ -187,6 +195,7 @@ search:
 }
 
 // remote is a standalone goroutine to handle remote mining related stuff.
+// 收workCh管道的消息
 func (ethash *Ethash) remote(notify []string, noverify bool) {
 	var (
 		works = make(map[common.Hash]*types.Block)
@@ -203,8 +212,10 @@ func (ethash *Ethash) remote(notify []string, noverify bool) {
 		}
 		notifyReqs = make([]*http.Request, len(notify))
 	)
+
 	// notifyWork notifies all the specified mining endpoints of the availability of
 	// new work to be processed.
+	// 将currentWork的信息通过http协议发送出去
 	notifyWork := func() {
 		work := currentWork
 		blob, _ := json.Marshal(work)
@@ -229,6 +240,7 @@ func (ethash *Ethash) remote(notify []string, noverify bool) {
 			}(notifyReqs[i], url)
 		}
 	}
+
 	// makeWork creates a work package for external miner.
 	//
 	// The work package consists of 3 strings:
@@ -236,6 +248,7 @@ func (ethash *Ethash) remote(notify []string, noverify bool) {
 	//   result[1], 32 bytes hex encoded seed hash used for DAG
 	//   result[2], 32 bytes hex encoded boundary condition ("target"), 2^256/difficulty
 	//   result[3], hex encoded block number
+	// 将信息存入currentWork、currentBlock、works为三个变量中
 	makeWork := func(block *types.Block) {
 		hash := ethash.SealHash(block.Header())
 
@@ -251,6 +264,7 @@ func (ethash *Ethash) remote(notify []string, noverify bool) {
 	// submitWork verifies the submitted pow solution, returning
 	// whether the solution was accepted or not (not can be both a bad pow as well as
 	// any other error, like no pending work or stale mining result).
+	// 对提交的方案进行验证
 	submitWork := func(nonce types.BlockNonce, mixDigest common.Hash, sealhash common.Hash) bool {
 		if currentBlock == nil {
 			log.Error("Pending work without block", "sealhash", sealhash)

@@ -200,8 +200,11 @@ func (lru *lru) get(epoch uint64) (item, future interface{}) {
 }
 
 // cache wraps an ethash cache with some metadata to allow easier concurrent use.
+//
 type cache struct {
-	epoch uint64    // Epoch for which this cache is relevant
+	epoch uint64 // Epoch for which this cache is relevant
+
+	// 从磁盘中读取文件
 	dump  *os.File  // File descriptor of the memory mapped cache
 	mmap  mmap.MMap // Memory map itself to unmap before releasing
 	cache []uint32  // The actual cache data content (may be memory mapped)
@@ -440,6 +443,7 @@ type sealWork struct {
 type Ethash struct {
 	config Config
 
+	// cache 和 datase lru
 	caches   *lru // In memory caches to avoid regenerating too often
 	datasets *lru // In memory datasets to avoid regenerating too often
 
@@ -469,6 +473,7 @@ type Ethash struct {
 // New creates a full sized ethash PoW scheme and starts a background thread for
 // remote mining, also optionally notifying a batch of remote services of new work
 // packages.
+// 创建 ethash POW 框架
 func New(config Config, notify []string, noverify bool) *Ethash {
 	if config.CachesInMem <= 0 {
 		log.Warn("One ethash cache must always be in memory", "requested", config.CachesInMem)

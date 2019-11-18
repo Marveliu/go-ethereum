@@ -136,6 +136,7 @@ func seedHash(block uint64) []byte {
 // algorithm from Strict Memory Hard Hashing Functions (2014). The output is a
 // set of 524288 64-byte values.
 // This method places the result into dest in machine byte order.
+// 给定seed，生成cache
 func generateCache(dest []uint32, epoch uint64, seed []byte) {
 	// Print some debug logs to allow analysis on low end devices
 	logger := log.New("epoch", epoch)
@@ -150,6 +151,7 @@ func generateCache(dest []uint32, epoch uint64, seed []byte) {
 		}
 		logFn("Generated ethash verification cache", "elapsed", common.PrettyDuration(elapsed))
 	}()
+
 	// Convert our destination slice to a byte buffer
 	header := *(*reflect.SliceHeader)(unsafe.Pointer(&dest))
 	header.Len *= 4
@@ -179,6 +181,9 @@ func generateCache(dest []uint32, epoch uint64, seed []byte) {
 	// Create a hasher to reuse between invocations
 	keccak512 := makeHasher(sha3.NewLegacyKeccak512())
 
+	// 对cache的初始化
+	// 首先将seed的哈希填入cache的第一个item
+	// 随后使用前一个item的哈希，填充后一个item
 	// Sequentially produce the initial dataset
 	keccak512(cache, seed)
 	for offset := uint64(hashBytes); offset < size; offset += hashBytes {
@@ -188,11 +193,18 @@ func generateCache(dest []uint32, epoch uint64, seed []byte) {
 	// Use a low-round version of randmemohash
 	temp := make([]byte, hashBytes)
 
+	// 第二个for循环是对cache数据的“加强”。
+	// 其逻辑为对于每一个item（srcOff），“随机”选一个item（xorOff）与其进行异或运算；
+	// 将运算结果的哈希写入dstOff中。这个运算逻辑将进行cacheRounds次。
 	for i := 0; i < cacheRounds; i++ {
 		for j := 0; j < rows; j++ {
 			var (
+				// 当srcOff代表倒数第x个item时，dstOff则代表正数第x个item。
+				// 从尾部向头部变化的
 				srcOff = ((j - 1 + rows) % rows) * hashBytes
+				// 从头部向尾部变化的
 				dstOff = j * hashBytes
+				// 区块高度 -> seed -> xofOff
 				xorOff = (binary.LittleEndian.Uint32(cache[dstOff:]) % uint32(rows)) * hashBytes
 			)
 			bitutil.XORBytes(temp, cache[srcOff:srcOff+hashBytes], cache[xorOff:xorOff+hashBytes])
@@ -218,6 +230,7 @@ func swap(buffer []byte) {
 // a non-associative substitute for XOR. Note that we multiply the prime with
 // the full 32-bit input, in contrast with the FNV-1 spec which multiplies the
 // prime with one byte (octet) in turn.
+// 聚合函数，将两个数slince合并到一起
 func fnv(a, b uint32) uint32 {
 	return a*0x01000193 ^ b
 }
@@ -231,30 +244,42 @@ func fnvHash(mix []uint32, data []uint32) {
 
 // generateDatasetItem combines data from 256 pseudorandomly selected cache nodes,
 // and hashes that to compute a single dataset node.
+// 生成dataset的item
+// cache 计算的数据源，index 代表将生成的item是第几个item，函数最终要得到的值存储在mix变量中
 func generateDatasetItem(cache []uint32, index uint32, keccak512 hasher) []byte {
 	// Calculate the number of theoretical rows (we use one buffer nonetheless)
 	rows := uint32(len(cache) / hashWords)
 
 	// Initialize the mix
+	// mix初始化
 	mix := make([]byte, hashBytes)
 
 	binary.LittleEndian.PutUint32(mix, cache[(index%rows)*hashWords]^index)
+	// hashWords代表的是一个hash里有多少个word值
+	// 一个hash的长度为hashBytes即64字节
+	// 一个word（uint32类型）的长度为4字节，因此hashWords值为16。
 	for i := 1; i < hashWords; i++ {
+		// 选取cache中的哪一项数据是由参数index和i变量决定的。
 		binary.LittleEndian.PutUint32(mix[i*4:], cache[(index%rows)*hashWords+uint32(i)])
 	}
 	keccak512(mix, mix)
 
 	// Convert the mix to uint32s to avoid constant bit shifting
+	// 只是将mix转换成[]uint32类型，并将其转存到intMix中。
 	intMix := make([]uint32, hashWords)
 	for i := 0; i < len(intMix); i++ {
 		intMix[i] = binary.LittleEndian.Uint32(mix[i*4:])
 	}
 	// fnv it with a lot of random cache nodes based on index
+	// intMix的强化
+	// 利用index参数和i变量计算出一个cache数据的索引，然后将这个cache数据合入intMix中。
+	// fnv和fnvHash被称作聚合函数
 	for i := uint32(0); i < datasetParents; i++ {
 		parent := fnv(index^i, intMix[i%16]) % rows
 		fnvHash(intMix, cache[parent*hashWords:])
 	}
 	// Flatten the uint32 mix into a binary one and return
+	// 将intMix又恢复成mix。最后计算mix的哈希后，返回计算后的哈希值。
 	for i, val := range intMix {
 		binary.LittleEndian.PutUint32(mix[i*4:], val)
 	}
@@ -264,6 +289,7 @@ func generateDatasetItem(cache []uint32, index uint32, keccak512 hasher) []byte 
 
 // generateDataset generates the entire ethash dataset for mining.
 // This method places the result into dest in machine byte order.
+// 生成dataset
 func generateDataset(dest []uint32, epoch uint64, cache []uint32) {
 	// Print some debug logs to allow analysis on low end devices
 	logger := log.New("epoch", epoch)
@@ -296,6 +322,8 @@ func generateDataset(dest []uint32, epoch uint64, cache []uint32) {
 	pend.Add(threads)
 
 	var progress uint32
+
+	// 多线程生成dataset
 	for i := 0; i < threads; i++ {
 		go func(id int) {
 			defer pend.Done()
@@ -304,13 +332,16 @@ func generateDataset(dest []uint32, epoch uint64, cache []uint32) {
 			keccak512 := makeHasher(sha3.NewLegacyKeccak512())
 
 			// Calculate the data segment this thread should generate
+			// 计算当前线程需要生成的数据项的起始和结束索引
 			batch := uint32((size + hashBytes*uint64(threads) - 1) / (hashBytes * uint64(threads)))
 			first := uint32(id) * batch
 			limit := first + batch
 			if limit > uint32(size/hashBytes) {
 				limit = uint32(size / hashBytes)
 			}
+
 			// Calculate the dataset segment
+			// 生成dataset
 			percent := uint32(size / hashBytes / 100)
 			for index := first; index < limit; index++ {
 				item := generateDatasetItem(cache, index, keccak512)
@@ -336,6 +367,7 @@ func hashimoto(hash []byte, nonce uint64, size uint64, lookup func(index uint32)
 	rows := uint32(size / mixBytes)
 
 	// Combine header+nonce into a 64 byte seed
+	// 先利用hash（区块头哈希）和nonce生成一个seed
 	seed := make([]byte, 40)
 	copy(seed, hash)
 	binary.LittleEndian.PutUint64(seed[32:], nonce)
@@ -344,14 +376,21 @@ func hashimoto(hash []byte, nonce uint64, size uint64, lookup func(index uint32)
 	seedHead := binary.LittleEndian.Uint32(seed)
 
 	// Start the mix with replicated seed
+	// 然后使用这个seed对mix变量作初始化。注意这个mix就是就是函数最终要计算的值
 	mix := make([]uint32, mixBytes/4)
 	for i := 0; i < len(mix); i++ {
 		mix[i] = binary.LittleEndian.Uint32(seed[i%16*4:])
 	}
+
+	// 使用dataset中的数据“强化”mix
 	// Mix in random dataset nodes
 	temp := make([]uint32, len(mix))
 
 	for i := 0; i < loopAccesses; i++ {
+		// parent变量是由i、seedHead、mix计算所得
+		// 注意parent变量的随机性和确定性。
+		// 随机性是由于seedHead和mix都是由seed计算所得，而seed又是由hash(区块头哈希)和nonce计算所得。所以在确定hash和nonce之前，parent变量的值在每次计算时是不能确定的；
+		// 而一旦确定了hash和nonce之后，parent的值在每次计算时又肯定是确定的。
 		parent := fnv(uint32(i)^seedHead, mix[i%len(mix)]) % rows
 		for j := uint32(0); j < mixBytes/hashBytes; j++ {
 			copy(temp[j*hashWords:], lookup(2*parent+j))
@@ -359,6 +398,7 @@ func hashimoto(hash []byte, nonce uint64, size uint64, lookup func(index uint32)
 		fnvHash(mix, temp)
 	}
 	// Compress mix
+	// 接下来的代码就是整理mix以及计算相应的哈希值并返回
 	for i := 0; i < len(mix); i += 4 {
 		mix[i/4] = fnv(fnv(fnv(mix[i], mix[i+1]), mix[i+2]), mix[i+3])
 	}
@@ -393,6 +433,7 @@ func hashimotoLight(size uint64, cache []uint32, hash []byte, nonce uint64) ([]b
 // dataset) in order to produce our final value for a particular header hash and
 // nonce.
 func hashimotoFull(dataset []uint32, hash []byte, nonce uint64) ([]byte, []byte) {
+	// 在给定索引后，可以直接从dataset数据中中读取相应的item并返回
 	lookup := func(index uint32) []uint32 {
 		offset := index * hashWords
 		return dataset[offset : offset+hashWords]

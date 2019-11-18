@@ -38,6 +38,7 @@ type API struct {
 //   result[1] - 32 bytes hex encoded seed hash used for DAG
 //   result[2] - 32 bytes hex encoded boundary condition ("target"), 2^256/difficulty
 //   result[3] - hex encoded block number
+// 获取挖矿信息
 func (api *API) GetWork() ([4]string, error) {
 	if api.ethash.config.PowMode != ModeNormal && api.ethash.config.PowMode != ModeTest {
 		return [4]string{}, errors.New("not supported")
@@ -65,6 +66,7 @@ func (api *API) GetWork() ([4]string, error) {
 // SubmitWork can be used by external miner to submit their POW solution.
 // It returns an indication if the work was accepted.
 // Note either an invalid solution, a stale work a non-existent work will return false.
+// 挖矿成功，将有效的Nonce值和MixDigest提交，等待验证
 func (api *API) SubmitWork(nonce types.BlockNonce, hash, digest common.Hash) bool {
 	if api.ethash.config.PowMode != ModeNormal && api.ethash.config.PowMode != ModeTest {
 		return false

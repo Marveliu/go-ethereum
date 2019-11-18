@@ -68,11 +68,12 @@ type Miner struct {
 
 func New(eth Backend, config *Config, chainConfig *params.ChainConfig, mux *event.TypeMux, engine consensus.Engine, isLocalBlock func(block *types.Block) bool) *Miner {
 	miner := &Miner{
-		eth:      eth,
-		mux:      mux,
-		engine:   engine,
-		exitCh:   make(chan struct{}),
-		worker:   newWorker(config, chainConfig, engine, eth, mux, isLocalBlock),
+		eth:    eth,
+		mux:    mux,
+		engine: engine,
+		exitCh: make(chan struct{}),
+		worker: newWorker(config, chainConfig, engine, eth, mux, isLocalBlock),
+		// shouldStart 的值没有被设置，默认值为0
 		canStart: 1,
 	}
 	go miner.update()
@@ -95,14 +96,18 @@ func (self *Miner) update() {
 				return
 			}
 			switch ev.Data.(type) {
+			// 收到了 downloader 开始同步的消息
 			case downloader.StartEvent:
+				// canStart set 0
 				atomic.StoreInt32(&self.canStart, 0)
 				if self.Mining() {
+					// 停止挖矿
 					self.Stop()
 					atomic.StoreInt32(&self.shouldStart, 1)
 					log.Info("Mining aborted due to sync")
 				}
 			case downloader.DoneEvent, downloader.FailedEvent:
+				// downloader 模块结束
 				shouldStart := atomic.LoadInt32(&self.shouldStart) == 1
 
 				atomic.StoreInt32(&self.canStart, 1)
@@ -119,10 +124,13 @@ func (self *Miner) update() {
 	}
 }
 
+// 启动挖矿
 func (self *Miner) Start(coinbase common.Address) {
+	// shouldStart 应该启动
 	atomic.StoreInt32(&self.shouldStart, 1)
 	self.SetEtherbase(coinbase)
 
+	// 如果不可以启动，就直接返回；否则调用 worker.start 启动
 	if atomic.LoadInt32(&self.canStart) == 0 {
 		log.Info("Network syncing, will start miner afterwards")
 		return
@@ -130,6 +138,7 @@ func (self *Miner) Start(coinbase common.Address) {
 	self.worker.start()
 }
 
+// 停止挖矿
 func (self *Miner) Stop() {
 	self.worker.stop()
 	atomic.StoreInt32(&self.shouldStart, 0)
