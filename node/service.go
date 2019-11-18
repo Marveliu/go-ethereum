@@ -53,10 +53,14 @@ func (ctx *ServiceContext) OpenDatabase(name string, cache int, handles int, nam
 // also attaching a chain freezer to it that moves ancient chain data from the
 // database to immutable append-only files. If the node is an ephemeral one, a
 // memory database is returned.
+// 打开给定namespace的数据库，如果没有则创建
 func (ctx *ServiceContext) OpenDatabaseWithFreezer(name string, cache int, handles int, freezer string, namespace string) (ethdb.Database, error) {
+	// 如果没有配置目录地址
 	if ctx.config.DataDir == "" {
+		// 创建内存数据库
 		return rawdb.NewMemoryDatabase(), nil
 	}
+	// namespace 解析地址
 	root := ctx.config.ResolvePath(name)
 
 	switch {

@@ -128,16 +128,24 @@ type blockChain interface {
 }
 
 // TxPoolConfig are the configuration parameters of the transaction pool.
+// 交易池配置
 type TxPoolConfig struct {
-	Locals    []common.Address // Addresses that should be treated by default as local
-	NoLocals  bool             // Whether local transaction handling should be disabled
-	Journal   string           // Journal of local transactions to survive node restarts
-	Rejournal time.Duration    // Time interval to regenerate the local transaction journal
+	// 本地地址
+	Locals []common.Address // Addresses that should be treated by default as local
+	// 是否处理本地的交易
+	NoLocals bool // Whether local transaction handling should be disabled
 
+	// 本地交易记录，为了节点的重启
+	Journal   string        // Journal of local transactions to survive node restarts
+	Rejournal time.Duration // Time interval to regenerate the local transaction journal
+
+	// 交易池 gas相关配置
 	PriceLimit uint64 // Minimum gas price to enforce for acceptance into the pool
 	PriceBump  uint64 // Minimum price bump percentage to replace an already existing transaction (nonce)
 
+	// 每个账号可执行交易数
 	AccountSlots uint64 // Number of executable transaction slots guaranteed per account
+	// 全局可执行交易数
 	GlobalSlots  uint64 // Maximum number of executable transaction slots for all accounts
 	AccountQueue uint64 // Maximum number of non-executable transaction slots permitted per account
 	GlobalQueue  uint64 // Maximum number of non-executable transaction slots for all accounts

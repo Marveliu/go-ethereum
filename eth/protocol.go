@@ -116,6 +116,7 @@ type statusData63 struct {
 }
 
 // statusData is the network packet for the status message for eth/64 and later.
+// 握手信息
 type statusData struct {
 	ProtocolVersion uint32
 	NetworkID       uint64
@@ -133,10 +134,11 @@ type newBlockHashesData []struct {
 
 // getBlockHeadersData represents a block header query.
 type getBlockHeadersData struct {
-	Origin  hashOrNumber // Block from which to retrieve headers
-	Amount  uint64       // Maximum number of headers to retrieve
-	Skip    uint64       // Blocks to skip between consecutive headers
-	Reverse bool         // Query direction (false = rising towards latest, true = falling towards genesis)
+	Origin hashOrNumber // Block from which to retrieve headers
+	Amount uint64       // Maximum number of headers to retrieve
+	Skip   uint64       // Blocks to skip between consecutive headers
+	// 查询顺序
+	Reverse bool // Query direction (false = rising towards latest, true = falling towards genesis)
 }
 
 // hashOrNumber is a combined field for specifying an origin block.

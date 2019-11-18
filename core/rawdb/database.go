@@ -106,6 +106,7 @@ func NewDatabase(db ethdb.KeyValueStore) ethdb.Database {
 // storage.
 func NewDatabaseWithFreezer(db ethdb.KeyValueStore, freezer string, namespace string) (ethdb.Database, error) {
 	// Create the idle freezer instance
+	// 懒加载freezer
 	frdb, err := newFreezer(freezer, namespace)
 	if err != nil {
 		return nil, err

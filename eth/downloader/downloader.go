@@ -284,6 +284,7 @@ func (d *Downloader) Synchronising() bool {
 
 // RegisterPeer injects a new download peer into the set of block source to be
 // used for fetching hashes and blocks from.
+// 向peers对象添加peer
 func (d *Downloader) RegisterPeer(id string, version int, peer Peer) error {
 	logger := log.New("peer", id)
 	logger.Trace("Registering sync peer")
@@ -413,6 +414,7 @@ func (d *Downloader) synchronise(id string, hash common.Hash, td *big.Int, mode 
 
 // syncWithPeer starts a block synchronization based on the hash chain from the
 // specified peer and head hash.
+// 和Peer进行同步
 func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.Int) (err error) {
 	d.mux.Post(StartEvent{})
 	defer func() {
@@ -434,6 +436,7 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	}(time.Now())
 
 	// Look up the sync boundaries: the common ancestor and the target block
+	// 获得同步的边界
 	latest, err := d.fetchHeight(p)
 	if err != nil {
 		return err
@@ -452,11 +455,14 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	d.syncStatsLock.Unlock()
 
 	// Ensure our origin point is below any fast sync pivot point
+	//
 	pivot := uint64(0)
 	if d.mode == FastSync {
+		// 对方的高度小于最小完整同步区块数，直接从0开始同步
 		if height <= uint64(fsMinFullBlocks) {
 			origin = 0
 		} else {
+			// 设置pivot
 			pivot = height - uint64(fsMinFullBlocks)
 			if pivot <= origin {
 				origin = pivot - 1
@@ -698,11 +704,16 @@ func calculateRequestSpan(remoteHeight, localHeight uint64) (int64, int, int, ui
 // on the correct chain, checking the top N links should already get us a match.
 // In the rare scenario when we ended up on a long reorganisation (i.e. none of
 // the head links match), we do a binary search to find the common ancestor.
+// 定位共同的祖先
+// 1. 通过获取一组高度区间内，固定间隔高度的区块，看是否能从这些区块中找到一个本地也拥有的区块
+// 2. 从一个高度区间内，通过二分查找共同区块
 func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header) (uint64, error) {
 	// Figure out the valid ancestor range to prevent rewrite attacks
 	var (
-		floor        = int64(-1)
-		localHeight  uint64
+		floor = int64(-1)
+		// 本地节点高度
+		localHeight uint64
+		// 远程节点高度
 		remoteHeight = remoteHeader.Number.Uint64()
 	)
 	switch d.mode {
@@ -740,9 +751,15 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 		}
 	}
 
+	// 计算要获得饿高度区间和间隔
+	// from  从哪一个高度开始获得区块
+	// count 表示一共从远程节点获得了多少个区块
+	// skip  代表了间隔， skip=3,from=10 -> 10, 14, 18
+	// max   代表高度的上限
 	from, count, skip, max := calculateRequestSpan(remoteHeight, localHeight)
 
 	p.log.Trace("Span searching for common ancestor", "count", count, "from", from, "skip", skip)
+	// 发送header请求
 	go p.peer.RequestHeadersByNumber(uint64(from), count, skip, false)
 
 	// Wait for the remote response to the head fetch
@@ -755,20 +772,23 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 		select {
 		case <-d.cancelCh:
 			return 0, errCanceled
-
+		// 	等待返回请求的header数据并进行处理
 		case packet := <-d.headerCh:
 			// Discard anything not from the origin peer
+			// 验证返回的节点数据是否是我们请求数据的节点
 			if packet.PeerId() != p.id {
 				log.Debug("Received headers from incorrect peer", "peer", packet.PeerId())
 				break
 			}
 			// Make sure the peer actually gave something valid
+			// 验证返回的header数量
 			headers := packet.(*headerPack).headers
 			if len(headers) == 0 {
 				p.log.Warn("Empty head header set")
 				return 0, errEmptyHeaderSet
 			}
 			// Make sure the peer's reply conforms to the request
+			// 验证返回的headers是我们想要的高度
 			for i, header := range headers {
 				expectNumber := from + int64(i)*int64(skip+1)
 				if number := header.Number.Int64(); number != expectNumber {
@@ -778,12 +798,16 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 			}
 			// Check if a common ancestor was found
 			finished = true
+			// 从headers最后的一个元素开始查找，也就是高度最高的区块
 			for i := len(headers) - 1; i >= 0; i-- {
 				// Skip any headers that underflow/overflow our requested set
+				// 跳过不在我们请求的高度区间的区块
 				if headers[i].Number.Int64() < from || headers[i].Number.Uint64() > max {
 					continue
 				}
 				// Otherwise check if we already know the header or not
+				// 检查我们本地是否已经有某个区块了，如果有就是找到了共同的祖先
+				// 并将共同祖先的哈希和高度设置在number和hash变量中。
 				h := headers[i].Hash()
 				n := headers[i].Number.Uint64()
 
@@ -811,8 +835,13 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 			// Out of bounds delivery, ignore
 		}
 	}
+
 	// If the head fetch already found an ancestor, return
+	// 如果hash变量不是默认值，就认为是通过固定间隔的方式找到了祖先
 	if hash != (common.Hash{}) {
+		// floor 变量代表的是共同祖先的高度的最小值
+		// 如果找到共同祖先的高度比这个值还小，就认为是两个节点之间分叉太大了，不再允许进行同步。
+		// 如果一切正常，就返回找到的共同祖先的高度 number 变量。
 		if int64(number) <= floor {
 			p.log.Warn("Ancestor below allowance", "number", number, "hash", hash, "allowance", floor)
 			return 0, errInvalidAncestor
@@ -825,10 +854,13 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 	if floor > 0 {
 		start = uint64(floor)
 	}
-	p.log.Trace("Binary searching for common ancestor", "start", start, "end", end)
 
+	// 日自拍交，如果还没有找到共同的祖先，则继续使用二分法查找
+	p.log.Trace("Binary searching for common ancestor", "start", start, "end", end)
 	for start+1 < end {
+
 		// Split our chain interval in two, and request the hash to cross check
+		// 二分查找的内容是从远程节点上获取的
 		check := (start + end) / 2
 
 		ttl := d.requestTTL()
@@ -869,15 +901,20 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 				default:
 					known = d.lightchain.HasHeader(h, n)
 				}
+				// 区块不本地不存在，说明共同祖先的高度要比check变量小
 				if !known {
 					end = check
 					break
 				}
+
+				// 区块在本地存在
+				// 这里验证了一个远程返回区块的合法性
 				header := d.lightchain.GetHeaderByHash(h) // Independent of sync mode, header surely exists
 				if header.Number.Uint64() != check {
 					p.log.Debug("Received non requested header", "number", header.Number, "hash", header.Hash(), "request", check)
 					return 0, errBadPeer
 				}
+				// 既然区块在本地存在，说明共同祖先的高度要比check变量大
 				start = check
 				hash = h
 
@@ -908,6 +945,7 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 // other peers are only accepted if they map cleanly to the skeleton. If no one
 // can fill in the skeleton - not even the origin peer - it's assumed invalid and
 // the origin is dropped.
+// header 下载
 func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) error {
 	p.log.Debug("Directing header downloads", "origin", from)
 	defer p.log.Debug("Header download terminated")
@@ -920,14 +958,18 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 	defer timeout.Stop()
 
 	var ttl time.Duration
+
+	// 发起获取header的需求
 	getHeaders := func(from uint64) {
 		request = time.Now()
 
 		ttl = d.requestTTL()
 		timeout.Reset(ttl)
 
+		// 是否下载 skeleton
 		if skeleton {
 			p.log.Trace("Fetching skeleton headers", "count", MaxHeaderFetch, "from", from)
+			// 如果是则会从高度 from+MaxHeaderFetch-1 开始（包括），每隔 MaxHeaderFetch-1 的高度请求一个 header，最多请求 MaxSkeletonSize 个
 			go p.peer.RequestHeadersByNumber(from+uint64(MaxHeaderFetch)-1, MaxSkeletonSize, MaxHeaderFetch-1, false)
 		} else {
 			p.log.Trace("Fetching full headers", "count", MaxHeaderFetch, "from", from)
@@ -953,6 +995,8 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 			timeout.Stop()
 
 			// If the skeleton's finished, pull any remaining head headers directly from the origin
+			// packet.Items()为0代表获取的header数据为0，也就是没有数据可以获取了
+			// 进入这个if分支说明skeleton下载完成了
 			if packet.Items() == 0 && skeleton {
 				skeleton = false
 				getHeaders(from)
@@ -961,9 +1005,14 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 			// If no more headers are inbound, notify the content fetchers and return
 			if packet.Items() == 0 {
 				// Don't abort header fetches while the pivot is downloading
+				// 进入这个if说明所有header下载完了，发消息给headerProcCh通知header已全部下载完成
+				// Downloader.committed 字段代表的意义就是 pivot 区块的所有数据（包括 state）是否已经被提交到本地数据库中，如果是其值为 1，否则为 0
 				if atomic.LoadInt32(&d.committed) == 0 && pivot <= from {
 					p.log.Debug("No headers, waiting for pivot commit")
 					select {
+					// 如果 pivot 区块还没有被提交到本地数据库且当前请求的区块高度大于 pivot 的高度
+					// 那么就等一会（fsHeaderContCheck）再次请求新的 header，这里也是为了等待 pivot 区块的提交。
+					// 等待 pivot 提交
 					case <-time.After(fsHeaderContCheck):
 						getHeaders(from)
 						continue
@@ -983,7 +1032,9 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 			headers := packet.(*headerPack).headers
 
 			// If we received a skeleton batch, resolve internals concurrently
+			// 判断是否在处理 skeleton
 			if skeleton {
+				// 填充，返回填充的所有headers和已处理的header的索引
 				filled, proced, err := d.fillHeaderSkeleton(from, headers)
 				if err != nil {
 					p.log.Debug("Skeleton chain invalid", "err", err)
@@ -995,6 +1046,7 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 				// If we're closing in on the chain head, but haven't yet reached it, delay
 				// the last few headers so mini reorgs on the head don't cause invalid hash
 				// chain errors.
+				// 收到的是尾部的Header
 				if n := len(headers); n > 0 {
 					// Retrieve the current head we're at
 					var head uint64
@@ -1013,6 +1065,11 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 						head = ancestor
 					}
 					// If the head is way older than this batch, delay the last few headers
+					// 先判断本地的主链高度与新收到的 header 的最高高度的高度差是否在 reorgProtThreshold 以内
+					// 如果不是，就将高度最高的 reorgProtHeaderDelay 个 header 丢掉
+					// 解决经常出现的 「invalid hash chain」 错误，出现这个错误的原因是因为在我们上一次从远程节点获取到一些区块并将它们加入到本地的主链的过程中，远程节点发生了 reorg 操作
+					// 「reorg」 操作是由新产生的区块的竞争引起的，所以最新的几个区块是「不稳定的」，如果本次同步的区块数量较多（也就是我们同步时消耗的时间比较长）（在这里「本次同步的区数数量较多」的表现是新收到的区块的最高高度与本地数据库中的最高高度的差距大于 reorgProtThreshold），
+					// 那么在同步时可以先避免同步最新区块，这就是 reorgProtThreshold 和 reorgProtHeaderDelay 这个变量的由来。
 					if head+uint64(reorgProtThreshold) < headers[n-1].Number.Uint64() {
 						delay := reorgProtHeaderDelay
 						if delay > n {
@@ -1081,6 +1138,7 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 //
 // The method returns the entire filled skeleton and also the number of headers
 // already forwarded for processing.
+// Skeleton 填充
 func (d *Downloader) fillHeaderSkeleton(from uint64, skeleton []*types.Header) ([]*types.Header, int, error) {
 	log.Debug("Filling up skeleton", "from", from)
 	d.queue.ScheduleSkeleton(from, skeleton)
@@ -1112,6 +1170,7 @@ func (d *Downloader) fillHeaderSkeleton(from uint64, skeleton []*types.Header) (
 // fetchBodies iteratively downloads the scheduled block bodies, taking any
 // available peers, reserving a chunk of blocks for each, waiting for delivery
 // and also periodically checking for timeouts.
+// 获取区块body
 func (d *Downloader) fetchBodies(from uint64) error {
 	log.Debug("Downloading block bodies", "origin", from)
 
@@ -1136,6 +1195,7 @@ func (d *Downloader) fetchBodies(from uint64) error {
 // fetchReceipts iteratively downloads the scheduled block receipts, taking any
 // available peers, reserving a chunk of receipts for each, waiting for delivery
 // and also periodically checking for timeouts.
+// 获取receipt
 func (d *Downloader) fetchReceipts(from uint64) error {
 	log.Debug("Downloading transaction receipts", "origin", from)
 
@@ -1182,6 +1242,8 @@ func (d *Downloader) fetchReceipts(from uint64) error {
 //  - idle:        network callback to retrieve the currently (type specific) idle peers that can be assigned tasks
 //  - setIdle:     network callback to set a peer back to idle and update its estimated capacity (traffic shaping)
 //  - kind:        textual label of the type being downloaded to display in log mesages
+// 迭代下载计划的 block parts
+// 取区块的三部分数据的方法中（fillHeaderSkeleton、fetchBodies、fetchReceipts），都是调用 fetchParts 实现的
 func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack) (int, error), wakeCh chan bool,
 	expire func() map[string]int, pending func() int, inFlight func() bool, throttle func() bool, reserve func(*peerConnection, int) (*fetchRequest, bool, error),
 	fetchHook func([]*types.Header), fetch func(*peerConnection, *fetchRequest) error, cancel func(*fetchRequest), capacity func(*peerConnection) int,
@@ -1195,23 +1257,39 @@ func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack)
 
 	// Prepare the queue and fetch block parts until the block header fetcher's done
 	finished := false
+
+	// 其它几个 channel 在收到消息并进行简单的处理后，都会通知 udpate 进行下一步的处理。
+	// 在 update 处理代码中，包含了请求超时、下载完成或继续下载的相应处理。
 	for {
 		select {
 		case <-d.cancelCh:
 			return errCanceled
-
+		// deliveryCh 作用就是传递下载的数据，当有数据被真正下载下来时，就会给这个 channel 发消息将数据传递过来。
+		// 这个 channel 是与 Downloader 对象的 Deliver 方法相关的（DeliverHeaders、DeliverBodies、DeliverReceipts）
 		case packet := <-deliveryCh:
 			// If the peer was previously banned and failed to deliver its pack
 			// in a reasonable time frame, ignore its message.
+			// 这个参数的实际值为别是 Downloader.headerCh、Downloader.bodyCh、Downloader.receiptCh。
+
+			// 判断peer是否有效
 			if peer := d.peers.Peer(packet.PeerId()); peer != nil {
 				// Deliver the received chunk of data and check chain validity
+				// 如果有效则直接传递数据，并检查返回值
+				// 收到新下载成功的数据以后，将其传递到某个地方。从调用 fetchParts 处的代码看，这个参数所代表的函数都调用了 queue 对象的 Deliver 方法
+				// queue.DeliverHeaders、queue.DeliverBodies、queue.DeliverReceipts。也就是说，收到下载成功的数据以后，都给了 queue 进行处理。
 				accepted, err := deliver(packet)
 				if err == errInvalidChain {
 					return err
 				}
+
 				// Unless a peer delivered something completely else than requested (usually
 				// caused by a timed out request which came through in the end), set it to
 				// idle. If the delivery's stale, the peer should have already been idled.
+				// 设置节点为空闲状态
+				// setIdle 是一个回调函数，它将某个节点（peer）的对某类数据的下载状态设置为空间的（idle）。
+				// 这个函数的实际实现都是调用了 peerConnection 对象的相关方法：SetHeadersIdle、SetBodiesIdle、SetReceiptsIdle。
+				// 这样当再次需要下载此类数据时，就可以从这些空闲的节点中选取一个进行下载。
+				// 注意这里一个节点的空闲状态是针对某类数据而言的，比如节点没有在下载 header，它是一个 header 下载的空闲节点，但它仍可能正在下载 body 等数据。
 				if err != errStaleDelivery {
 					setIdle(peer, accepted)
 				}
@@ -1230,18 +1308,20 @@ func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack)
 			case update <- struct{}{}:
 			default:
 			}
-
+		// 唤醒 fetchParts，收到这个消息代表有新的情况可以处理了（有新的数据可以下载，或下载已完成了）
 		case cont := <-wakeCh:
 			// The header fetcher sent a continuation flag, check if it's done
+			// func (q *queue) DeliverHeaders
 			if !cont {
 				finished = true
 			}
 			// Headers arrive, try to update the progress
 			select {
+			// 更新整个操作流程
 			case update <- struct{}{}:
 			default:
 			}
-
+		// 定时任务
 		case <-ticker.C:
 			// Sanity check update the progress
 			select {
@@ -1249,12 +1329,21 @@ func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack)
 			default:
 			}
 
+		// 会使用所有的空闲节点下载数据，下载前会判断是否需要临时暂停一下
+		// 是否所有数据已经下载完成了；如果判断通过，则选取一定数据的下载任务，进行下载。
+		// 在最后，如果没有遇到空区块需要下载、且没有暂停下载、且所有有效节点都空闲、且确实有数据需要下载，但下载没有运行起来，就返回 errPeersUnavailable 错误。
 		case <-update:
 			// Short circuit if we lost all our peers
+			// 判断是否有有效节点
 			if d.peers.Len() == 0 {
 				return errNoPeers
 			}
 			// Check for fetch request timeouts and demote the responsible peers
+			// 获取所有的超时数据
+			// expire 是一个回调函数，会返回当前所有的超时数据信息。
+			// 这个函数的实际实现都是调用了 queue 对象的 Expire 方法：queue.ExpireHeaders、queue.ExpireBodies、queue.ExpireReceipts
+			// 这三个方法的参数就是超时阈值，这个值是 downloader.requestTTL 方法的返回值
+			// 在各个 Expire 方法中，会统计当前正在下载的数据中，起始时间与当前时间的差距超过给定阈值的数据，并将其返回
 			for pid, fails := range expire() {
 				if peer := d.peers.Peer(pid); peer != nil {
 					// If a lot of retrieval elements expired, we might have overestimated the remote peer or perhaps
@@ -1264,10 +1353,13 @@ func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack)
 					// The reason the minimum threshold is 2 is because the downloader tries to estimate the bandwidth
 					// and latency of a peer separately, which requires pushing the measures capacity a bit and seeing
 					// how response times reacts, to it always requests one more than the minimum (i.e. min 2).
+					// 果某个节点下载的下载超时数据量太多（大于 2 个），有可能是因为我们过于高估了对方或自己的网络吞吐能力，因此调用 setIdle 将这个节点设置成空闲状态
 					if fails > 2 {
 						peer.log.Trace("Data delivery timed out", "type", kind)
 						setIdle(peer, 0)
 					} else {
+						// 果超时的数据量小于 2 个，则直接断开与这个节点间的连接
+						// 如果一个节点在某次下载中应该下载 100 条数据，有一条超时了，这种情况也会导致断开连接？
 						peer.log.Debug("Stalling delivery, dropping", "type", kind)
 
 						if d.dropPeer == nil {
@@ -1290,20 +1382,39 @@ func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack)
 					}
 				}
 			}
+
 			// If there's nothing more to fetch, wait or terminate
+			// 如果没有需要下载的数据，就继续等待或或如果所有数据处理完成的话就返回
+			// pending 参数代表了一个回调函数，刚才我们提到，其目的是判断是否还有需要下载的数据。
+			// 它的实际值是 queue 对象的 Pending 方法：queue.PendingHeaders、queue.PendingBlocks、queue.PendingReceipts。
+			// 这些 Pending 方法会返回 queue 对象内部记录的各自待下载的任务数量。
 			if pending() == 0 {
+				// inFlight 参数也是一个回调函数，从名字就可以看出，它的目的是判断是否还有正在下载的、但还没下载完成的数据（所谓「漂在空中」）。
+				// 它的实际值是 queue 对象的 InFlight 方法：queue.InFlightHeaders、queue.InFlightBlocks、queue.InFlightReceipts。
+				// 这些 InFlight 方法的实现与 Pending 方法类似，会返回 queue 对象内部记录的正在下载的数据数量。
 				if !inFlight() && finished {
 					log.Debug("Data fetching completed", "type", kind)
 					return nil
 				}
 				break
 			}
+
 			// Send a download request to all idle peers, until throttled
 			progressed, throttled, running := false, false, inFlight()
+			// idle 参数是一个回调函数，用来返回所有当前空闲的节点。
+			// 它的实际值是 peerSet 对象的 IdlePeers 方法：peerSet.HeaderIdlePeers、peerSet.BodyIdlePeers、peerSet.ReceiptIdlePeers
+			// idle 参数是一个回调函数，用来返回所有当前空闲的节点。它的实际值是 peerSet 对象的 IdlePeers 方法：peerSet.HeaderIdlePeers、peerSet.BodyIdlePeers、peerSet.ReceiptIdlePeers
 			idles, total := idle()
 
 			for _, peer := range idles {
+
 				// Short circuit if throttling activated
+				// throttle 参数也是一个回调函数，从名字可以看出，这个函数的功能是返回当前的下载是否需要暂停一下。
+				// 对于 header 的下载，它的实际值是一个总是返回 false 的函数（可见下载 header 时是从来不会暂停一下的）；
+				// 而对于 body 和 receipt，它的实际值是 queue 对象的 ShouldThrottle 方法：queue.ShouldThrottleBlocks、queue.ShouldThrottleReceipts。
+				// 下载过程中暂停是为了防止占用本地太多的内存
+				// 从 queue 对象的 ShouldThrottle 方法的实现来看，如果下载中的数据个数加上下载完成但仍在缓存中的数据个数，超过了 limit，就需要暂停一下；
+				// 而 limit 最大值是 blockCacheMemory 这么大小的内存（64 M）所以存放的数据个数。
 				if throttle() {
 					throttled = true
 					break
@@ -1312,9 +1423,21 @@ func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack)
 				if pending() == 0 {
 					break
 				}
+
 				// Reserve a chunk of fetches for a peer. A nil can mean either that
 				// no more headers are available, or that the peer is known not to
 				// have them.
+				// reserve 参数是一个回调函数，它的目的是从下载任务中选取一些可以下载的任务，并构造一个 fetchRequest 结构。
+				// 它的实际实现都是调用 queue 对象的 Reserve 方法：queue.ReserveHeaders、queue.ReserveBodies、queue.ReserveReceipts。
+				// 除了返回 fetchRequest 对象，它还返回一个 process 变量，标记着是否有空的数据正在被处理。
+				// 比如有可能某区块中未包含任何一条交易，因此它的 body 和 receipt 都是空的，这种数据其实是不需要下载的。
+				// 在 queue 对象的 Reserve 方法中，会对这种情况进行识别。如果遇到空的数据，这些数据会被直接标记为下载成功。在方法返回时，就将是否发生过「直接标记为下载成功」的情况返回。
+				//
+				// capacity 参数也是一个回调函数，它的功能是用来决定此次下载需要请求的数据的个数。
+				// 它的实际实现都是调用 peerConnection 的 Capacity 方法：peerConnection.HeaderCapacity、peerConnection.BlockCapacity、peerConnection.ReceiptCapacity。
+				// 这些 Capacity 方法会根据自身所代表的节点在之前的下载过程中的吞吐量，来决定本次下载的数量。
+				// capacity 参与要与 setIdle 参数合起来看。因为在调用 setIlde 时，会将节点本次接收到的数据个数进行记录。
+				// 而 peerConnection 的 Capacity 方法正是通过上次 setIdle 记录的数据进行计算的。
 				request, progress, err := reserve(peer, capacity(peer))
 				if err != nil {
 					return err
@@ -1334,6 +1457,7 @@ func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack)
 				if fetchHook != nil {
 					fetchHook(request.Headers)
 				}
+				// fetch 参数也是一个回调函数，它的功能很明显，就是发送获取数据的请求
 				if err := fetch(peer, request); err != nil {
 					// Although we could try and make an attempt to fix this, this error really
 					// means that we've double allocated a fetch task to a peer. If that is the
@@ -1356,6 +1480,7 @@ func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack)
 // processHeaders takes batches of retrieved headers from an input channel and
 // keeps processing and scheduling them into the header chain and downloader's
 // queue until the stream ends or a failure occurs.
+// 处理接收的Header
 func (d *Downloader) processHeaders(origin uint64, pivot uint64, td *big.Int) error {
 	// Keep a count of uncertain headers to roll back
 	var rollback []*types.Header
@@ -1391,11 +1516,12 @@ func (d *Downloader) processHeaders(origin uint64, pivot uint64, td *big.Int) er
 		select {
 		case <-d.cancelCh:
 			return errCanceled
-
+		// 提取Header
 		case headers := <-d.headerProcCh:
 			// Terminate header processing if we synced up
 			if len(headers) == 0 {
 				// Notify everyone that headers are fully processed
+				// header全部下载完成，向bodyWakeCh和receiptWakeCh通知这一消息
 				for _, ch := range []chan bool{d.bodyWakeCh, d.receiptWakeCh} {
 					select {
 					case ch <- false:
@@ -1463,6 +1589,9 @@ func (d *Downloader) processHeaders(origin uint64, pivot uint64, td *big.Int) er
 					}
 					// If we're importing pure headers, verify based on their recentness
 					frequency := fsHeaderCheckFrequency
+					// chunk 变量代表的是一组将要写入本地数据库的 header
+					// frequency 用来传递给 lightchain.InsertHeaderChain，其意义是在将要插入的所有区块头中，每隔多少个高度检查一下 header 的有效性
+					// chunk中的区块的最高高度加上 fsHeaderForceVerify 大于 pivot 参数，那么对 header 的检查就公比较严格。
 					if chunk[len(chunk)-1].Number.Uint64()+uint64(fsHeaderForceVerify) > pivot {
 						frequency = 1
 					}
@@ -1508,6 +1637,7 @@ func (d *Downloader) processHeaders(origin uint64, pivot uint64, td *big.Int) er
 			d.syncStatsLock.Unlock()
 
 			// Signal the content downloaders of the availablility of new tasks
+			// 有新的header下载完成了，但还没有全部完成。向bodyWakeCh和receiptWakeCh通知这一消息
 			for _, ch := range []chan bool{d.bodyWakeCh, d.receiptWakeCh} {
 				select {
 				case ch <- true:
@@ -1571,9 +1701,13 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 
 // processFastSyncContent takes fetch results from the queue and writes them to the
 // database. It also controls the synchronisation of state nodes of the pivot block.
+// 处理快速同步的内容
+// latest 参数就是同步开始时计算的同步区间的最高高度
 func (d *Downloader) processFastSyncContent(latest *types.Header) error {
+
 	// Start syncing state of the reported head block. This should get us most of
 	// the state of the pivot block.
+	// 同步latest的state数据
 	sync := d.syncState(latest.Root)
 	defer sync.Cancel()
 	closeOnErr := func(s *stateSync) {
@@ -1584,6 +1718,7 @@ func (d *Downloader) processFastSyncContent(latest *types.Header) error {
 	go closeOnErr(sync)
 	// Figure out the ideal pivot block. Note, that this goalpost may move if the
 	// sync takes long enough for the chain head to move significantly.
+	// 计算pivot
 	pivot := uint64(0)
 	if height := latest.Number.Uint64(); height > uint64(fsMinFullBlocks) {
 		pivot = height - uint64(fsMinFullBlocks)
@@ -1595,8 +1730,10 @@ func (d *Downloader) processFastSyncContent(latest *types.Header) error {
 		oldTail  []*fetchResult // Downloaded content after the pivot
 	)
 	for {
+
 		// Wait for the next batch of downloaded data to be available, and if the pivot
 		// block became stale, move the goalpost
+		// 等待有可用的完整的区块数据
 		results := d.queue.Results(oldPivot == nil) // Block if we're not monitoring pivot staleness
 		if len(results) == 0 {
 			// If pivot sync is done, stop
@@ -1614,10 +1751,16 @@ func (d *Downloader) processFastSyncContent(latest *types.Header) error {
 		if d.chainInsertHook != nil {
 			d.chainInsertHook(results)
 		}
+		// oldPivot 代表的意思是我们发现了一个 pivot 区块，但还未成功写入本地数据库。
+		// 我们需要将它们入到 results 中
 		if oldPivot != nil {
 			results = append(append([]*fetchResult{oldPivot}, oldTail...), results...)
 		}
+
 		// Split around the pivot block and process the two sides via fast/full sync
+		// 更新pivot
+		// 即如果还没有 pivot 区块被提交过，且当前获取到的区块高度已经比当前的 pivot 高度超出了太多（2 * fsMinFullBlocks），就要利用新区块的高度重新计算 pivot。
+		// 为了防止高度持续整张，旧区块的state被修剪，无法下载完整的数据
 		if atomic.LoadInt32(&d.committed) == 0 {
 			latest = results[len(results)-1].Header
 			if height := latest.Number.Uint64(); height > pivot+2*uint64(fsMinFullBlocks) {
@@ -1625,12 +1768,19 @@ func (d *Downloader) processFastSyncContent(latest *types.Header) error {
 				pivot = height - uint64(fsMinFullBlocks)
 			}
 		}
+
+		// 以 pivot 为界，切分 results
+		// P 代表 pivot 区块。
 		P, beforeP, afterP := splitAroundPivot(pivot, results)
+		//  beforeP 写入本地数据库。注意这些区块是没有 state 数据的。
 		if err := d.commitFastSyncData(beforeP, sync); err != nil {
 			return err
 		}
+
+		//  特殊处理 P：下载其 state 数据，并调用 commitPivotBlock 提交到本地数据库
 		if P != nil {
 			// If new pivot block found, cancel old state retrieval and restart
+			// 发现新的pivot，则重新开始
 			if oldPivot != P {
 				sync.Cancel()
 
@@ -1645,17 +1795,22 @@ func (d *Downloader) processFastSyncContent(latest *types.Header) error {
 				if sync.err != nil {
 					return sync.err
 				}
+				// commitPivotBlock 会将 Downloader.committed 设置为 1
+				// 将pivot前的块存下来
 				if err := d.commitPivotBlock(P); err != nil {
 					return err
 				}
 				oldPivot = nil
 
 			case <-time.After(time.Second):
+				// 如果下载 P 的 state 数据超时，则使用 oldTail 存储还未写入本地数据库的 afterP ，然后重新从第 1 步开始。
+				// oldPivot 代表的意思是我们发现了一个 pivot 区块，但还未成功写入本地数据库。
 				oldTail = afterP
 				continue
 			}
 		}
 		// Fast sync done, pivot commit done, full import
+		// pivot commit done，将 afterP 中的区块写入本地数据库。
 		if err := d.importBlockResults(afterP); err != nil {
 			return err
 		}
@@ -1781,13 +1936,22 @@ func (d *Downloader) deliver(id string, destCh chan dataPack, packet dataPack, i
 
 // qosTuner is the quality of service tuning loop that occasionally gathers the
 // peer latency statistics and updates the estimated request round trip time.
+// 每隔一段时间计算属于 Downloader 对象的 rtt
 func (d *Downloader) qosTuner() {
 	for {
 		// Retrieve the current median RTT and integrate into the previoust target RTT
+		// 使用旧值和当前所有节点 RTT 中位数更新 rtt 的值
 		rtt := time.Duration((1-qosTuningImpact)*float64(atomic.LoadUint64(&d.rttEstimate)) + qosTuningImpact*float64(d.peers.medianRTT()))
 		atomic.StoreUint64(&d.rttEstimate, uint64(rtt))
 
 		// A new RTT cycle passed, increase our confidence in the estimated RTT
+		// rtt 更新了，信心指数（rttConfidence）也需要跟着更新
+		// 即表示「在多大程序上相信 Downloader.rttEstimate 接近真实情况」，它的值总是小于或等于 1000000
+		// 在 Downloader.qosTuner 的实现中，根据之前 Downloader.rttEstimate 的值，新计算的值是等于或无限接近于 1000000 的。
+		//
+		// 每当有新节点接入时，新节点的 RTT 是一个估算值，可能与实际情况相差很大。
+		// 因此当有新节点接入时，RTT 的值相对来说是不可靠的，只有当进行了一段时间的数据通信以后，才会重新变得可靠一些。这个「信心指数」就是为了应对这种情况。
+		// 信心指数是为了帮助计算TTL
 		conf := atomic.LoadUint64(&d.rttConfidence)
 		conf = conf + (1000000-conf)/2
 		atomic.StoreUint64(&d.rttConfidence, conf)
@@ -1842,6 +2006,10 @@ func (d *Downloader) requestRTT() time.Duration {
 
 // requestTTL returns the current timeout allowance for a single download request
 // to finish under.
+// 计算TTL
+// RTT 和「信心指数」一起用来计算 TTL。由于 Downloader.rttConfidence 等于或无限接近于 1000000
+// 因此这个方法里 conf 变量的值是 1 或小于 1。所以 rtt / conf 的值应该大于或等于 rtt。
+// 也就是说，「信心指数」越小，得到的 TTL 值越大。即越没有信心，越要将超时间设置得宽松一些。
 func (d *Downloader) requestTTL() time.Duration {
 	var (
 		rtt  = time.Duration(atomic.LoadUint64(&d.rttEstimate))

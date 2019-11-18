@@ -131,6 +131,7 @@ func (pm *ProtocolManager) txsyncLoop() {
 
 // syncer is responsible for periodically synchronising with the network, both
 // downloading hashes and blocks as well as handling the announcement handler.
+// 区块同步
 func (pm *ProtocolManager) syncer() {
 	// Start and ensure cleanup of sync mechanisms
 	pm.fetcher.Start()
@@ -138,13 +139,16 @@ func (pm *ProtocolManager) syncer() {
 	defer pm.downloader.Terminate()
 
 	// Wait for different events to fire synchronisation operations
+	// 强制同步时间
 	forceSync := time.NewTicker(forceSyncCycle)
 	defer forceSync.Stop()
 
 	for {
 		select {
+		// 获得新节点
 		case <-pm.newPeerCh:
 			// Make sure we have peers to select from, then sync
+			// 收集到一定的节点之后再进行同步
 			if pm.peers.Len() < minDesiredPeerCount {
 				break
 			}
@@ -152,6 +156,7 @@ func (pm *ProtocolManager) syncer() {
 
 		case <-forceSync.C:
 			// Force a sync even if not enough peers are present
+			// 强制同步
 			go pm.synchronise(pm.peers.BestPeer())
 
 		case <-pm.noMorePeers:
@@ -161,12 +166,15 @@ func (pm *ProtocolManager) syncer() {
 }
 
 // synchronise tries to sync up our local block chain with a remote peer.
+// 和远程节点同步本地区块链信息
 func (pm *ProtocolManager) synchronise(peer *peer) {
 	// Short circuit if no peers are available
 	if peer == nil {
 		return
 	}
+
 	// Make sure the peer's TD is higher than our own
+	// 如果对方的TD比自己小，则没有必要同步
 	currentBlock := pm.blockchain.CurrentBlock()
 	td := pm.blockchain.GetTd(currentBlock.Hash(), currentBlock.NumberU64())
 
@@ -187,6 +195,7 @@ func (pm *ProtocolManager) synchronise(peer *peer) {
 		}
 	}
 	// Run the sync cycle, and disable fast sync if we've went past the pivot block
+	// 同步
 	if err := pm.downloader.Synchronise(peer.id, pHead, pTd, mode); err != nil {
 		return
 	}
@@ -211,6 +220,7 @@ func (pm *ProtocolManager) synchronise(peer *peer) {
 		// scenario will most often crop up in private and hackathon networks with
 		// degenerate connectivity, but it should be healthy for the mainnet too to
 		// more reliably update peers or the local TD state.
+		// 同步完进行消息的广播
 		go pm.BroadcastBlock(head, false)
 	}
 }

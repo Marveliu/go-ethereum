@@ -46,9 +46,23 @@ var (
 )
 
 // peerConnection represents an active peer from which hashes and blocks are retrieved.
+// 对 eth/peer 封装
+// 增加了一些统计的功能
+//
+// capacity: 计算自己在一个 RTT 周期内最多可以下载多少条数据
+// 1. HeaderCapacity
+// 2. BlockCapacity
+// 3. ReceiptCapacity
+// 4. NodeDataCapacity
+//
+// lack: 标记自己下载失败的数据
+// 1. MarkLacking
+// 2. Lacks
 type peerConnection struct {
 	id string // Unique identifier of the peer
 
+	// idle status: 标记自己是否正在下载某类数据
+	// 标记 idle 状态的目的是为了有新的数据请求时，可以选取空闲的节点用来发起请求，从而避免某一节点过于忙碌：
 	headerIdle  int32 // Current header activity state of the peer (idle = 0, active = 1)
 	blockIdle   int32 // Current block activity state of the peer (idle = 0, active = 1)
 	receiptIdle int32 // Current receipt activity state of the peer (idle = 0, active = 1)
@@ -144,6 +158,7 @@ func (p *peerConnection) Reset() {
 }
 
 // FetchHeaders sends a header retrieval request to the remote peer.
+// 从peer中获取header
 func (p *peerConnection) FetchHeaders(from uint64, count int) error {
 	// Sanity check the protocol version
 	if p.version < 62 {
@@ -153,6 +168,7 @@ func (p *peerConnection) FetchHeaders(from uint64, count int) error {
 	if !atomic.CompareAndSwapInt32(&p.headerIdle, 0, 1) {
 		return errAlreadyFetching
 	}
+	// 在 headerStarted 中记录 fetch 的起始时间
 	p.headerStarted = time.Now()
 
 	// Issue the header retrieval request (absolut upwards without gaps)
@@ -252,6 +268,8 @@ func (p *peerConnection) SetNodeDataIdle(delivered int) {
 
 // setIdle sets the peer to idle, allowing it to execute new retrieval requests.
 // Its estimated retrieval throughput is updated with that measured just now.
+// 在完成一轮下载之后调用
+// peerConnection.headerThroughput 的指针，而 delivered 参数代表本轮成功下载的数据的数量。
 func (p *peerConnection) setIdle(started time.Time, delivered int, throughput *float64, idle *int32) {
 	// Irrelevant of the scaling, make sure the peer ends up idle
 	defer atomic.StoreInt32(idle, 0)
@@ -264,10 +282,16 @@ func (p *peerConnection) setIdle(started time.Time, delivered int, throughput *f
 		*throughput = 0
 		return
 	}
+
 	// Otherwise update the throughput with a new measurement
+	// 利用 time.Since 计算时间差
 	elapsed := time.Since(started) + 1 // +1 (ns) to ensure non-zero divisor
+	// 将本次下载的数据量转换成 1 秒时间内下载的数据量 measured，再用 measured 动态更新 throughput 参数
 	measured := float64(delivered) / (float64(elapsed) / float64(time.Second))
 
+	// 更新rtt
+	// 新的 RTT 值由两部分组成：旧的 RTT 值和刚得到的时间差。
+	// 其中旧的 RTT 值占比 (1 - measurementImpact)，也就是 0.9，刚得到的时间差占比 measurementImpact，即 0.1。
 	*throughput = (1-measurementImpact)*(*throughput) + measurementImpact*measured
 	p.rtt = time.Duration((1-measurementImpact)*float64(p.rtt) + measurementImpact*float64(elapsed))
 
@@ -282,7 +306,8 @@ func (p *peerConnection) setIdle(started time.Time, delivered int, throughput *f
 func (p *peerConnection) HeaderCapacity(targetRTT time.Duration) int {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
-
+	// headerThroughput 代表的是当前节点一秒钟传输的数据的条数。
+	// 因此这个式子先把 RTT 换算成秒数，然后乘以 headerThroughput 得到一个 RTT 周期内可以传输多少条数据。
 	return int(math.Min(1+math.Max(1, p.headerThroughput*float64(targetRTT)/float64(time.Second)), float64(MaxHeaderFetch)))
 }
 
@@ -331,6 +356,7 @@ func (p *peerConnection) MarkLacking(hash common.Hash) {
 
 // Lacks retrieves whether the hash of a blockchain item is on the peers lacking
 // list (i.e. whether we know that the peer does not have it).
+// 标记某hash数据是缺少的
 func (p *peerConnection) Lacks(hash common.Hash) bool {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
@@ -341,6 +367,9 @@ func (p *peerConnection) Lacks(hash common.Hash) bool {
 
 // peerSet represents the collection of active peer participating in the chain
 // download procedure.
+// 对 peer 管理
+// 常规的功能（如使用 id 查询 peerConnection 对象、获取当前接入的节点个数、获取所有当前接入的节点等）
+// 返回空闲的节点，和计算所有节点的 RTT 的中位数值
 type peerSet struct {
 	peers        map[string]*peerConnection
 	newPeerFeed  event.Feed
@@ -382,8 +411,12 @@ func (ps *peerSet) Reset() {
 // The method also sets the starting throughput values of the new peer to the
 // average of all existing peers, to give it a realistic chance of being used
 // for data retrievals.
+// 设置peer
 func (ps *peerSet) Register(p *peerConnection) error {
+
 	// Retrieve the current median RTT as a sane default
+	// 初始化rtt
+	// 当前所有已连接的节点的 RTT 的中位数
 	p.rtt = ps.medianRTT()
 
 	// Register the new peer with some meaningful defaults
@@ -461,7 +494,9 @@ func (ps *peerSet) AllPeers() []*peerConnection {
 
 // HeaderIdlePeers retrieves a flat list of all the currently header-idle peers
 // within the active peer set, ordered by their reputation.
+// 获得查询header空闲的节点
 func (ps *peerSet) HeaderIdlePeers() ([]*peerConnection, int) {
+	// 使用 peerConnection.headerIdle 判断是否空闲
 	idle := func(p *peerConnection) bool {
 		return atomic.LoadInt32(&p.headerIdle) == 0
 	}
@@ -522,6 +557,7 @@ func (ps *peerSet) idlePeers(minProtocol, maxProtocol int, idleCheck func(*peerC
 	ps.lock.RLock()
 	defer ps.lock.RUnlock()
 
+	// 收集所有空闲节点
 	idle, total := make([]*peerConnection, 0, len(ps.peers)), 0
 	for _, p := range ps.peers {
 		if p.version >= minProtocol && p.version <= maxProtocol {
@@ -531,6 +567,7 @@ func (ps *peerSet) idlePeers(minProtocol, maxProtocol int, idleCheck func(*peerC
 			total++
 		}
 	}
+	// 将所有空闲节点按下载速度由高到低排序
 	for i := 0; i < len(idle); i++ {
 		for j := i + 1; j < len(idle); j++ {
 			if throughput(idle[i]) < throughput(idle[j]) {
@@ -548,6 +585,7 @@ func (ps *peerSet) medianRTT() time.Duration {
 	ps.lock.RLock()
 	defer ps.lock.RUnlock()
 
+	// 收集所有节点的 rtt 并排序
 	rtts := make([]float64, 0, len(ps.peers))
 	for _, p := range ps.peers {
 		p.lock.RLock()
@@ -556,6 +594,8 @@ func (ps *peerSet) medianRTT() time.Duration {
 	}
 	sort.Float64s(rtts)
 
+	// 获取中位数。如果连接的节点数多于 qosTuningPeers 个（5 个），
+	// 就用 rtt 值最高的 5 个节点的中位数（网络最好的 5 个节点的中位数）
 	median := rttMaxEstimate
 	if qosTuningPeers <= len(rtts) {
 		median = time.Duration(rtts[qosTuningPeers/2]) // Median of our tuning peers
@@ -563,6 +603,7 @@ func (ps *peerSet) medianRTT() time.Duration {
 		median = time.Duration(rtts[len(rtts)/2]) // Median of our connected peers (maintain even like this some baseline qos)
 	}
 	// Restrict the RTT into some QoS defaults, irrelevant of true RTT
+	// 限制最大最小值
 	if median < rttMinEstimate {
 		median = rttMinEstimate
 	}

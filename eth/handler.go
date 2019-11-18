@@ -63,6 +63,7 @@ func errResp(code errCode, format string, v ...interface{}) error {
 	return fmt.Errorf("%v - %v", code, fmt.Sprintf(format, v...))
 }
 
+// 实现消息处理，广播区块和交易，同步区块和交易的功能
 type ProtocolManager struct {
 	networkID  uint64
 	forkFilter forkid.Filter // Fork ID filter, constant across the lifetime of the node
@@ -70,12 +71,16 @@ type ProtocolManager struct {
 	fastSync  uint32 // Flag whether fast sync is enabled (gets disabled if we already have blocks)
 	acceptTxs uint32 // Flag whether we're considered synchronised (enables transaction processing)
 
+	// 检查点
 	checkpointNumber uint64      // Block number for the sync progress validator to cross reference
 	checkpointHash   common.Hash // Block hash for the sync progress validator to cross reference
 
-	txpool     txPool
+	// 交易池
+	txpool txPool
+	// 区块链
 	blockchain *core.BlockChain
-	maxPeers   int
+	// 最大节点数
+	maxPeers int
 
 	downloader *downloader.Downloader
 	fetcher    *fetcher.Fetcher
@@ -89,6 +94,7 @@ type ProtocolManager struct {
 	whitelist map[uint64]common.Hash
 
 	// channels for fetcher, syncer, txsyncLoop
+	// 通道
 	newPeerCh   chan *peer
 	txsyncCh    chan *txsync
 	quitSync    chan struct{}
@@ -101,6 +107,7 @@ type ProtocolManager struct {
 
 // NewProtocolManager returns a new Ethereum sub protocol manager. The Ethereum sub protocol manages peers capable
 // with the Ethereum network.
+// 创建协议管理器
 func NewProtocolManager(config *params.ChainConfig, checkpoint *params.TrustedCheckpoint, mode downloader.SyncMode, networkID uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database, cacheLimit int, whitelist map[uint64]common.Hash) (*ProtocolManager, error) {
 	// Create the protocol manager with the base fields
 	manager := &ProtocolManager{
@@ -152,6 +159,7 @@ func NewProtocolManager(config *params.ChainConfig, checkpoint *params.TrustedCh
 	if atomic.LoadUint32(&manager.fastSync) == 1 {
 		stateBloom = trie.NewSyncBloom(uint64(cacheLimit), chaindb)
 	}
+	// 创建downloader
 	manager.downloader = downloader.New(manager.checkpointNumber, chaindb, stateBloom, manager.eventMux, blockchain, nil, manager.removePeer)
 
 	// Construct the fetcher (short sync)
@@ -187,6 +195,7 @@ func NewProtocolManager(config *params.ChainConfig, checkpoint *params.TrustedCh
 		}
 		return n, err
 	}
+	// 创建fetcher
 	manager.fetcher = fetcher.New(blockchain.GetBlockByHash, validator, manager.BroadcastBlock, heighter, inserter, manager.removePeer)
 
 	return manager, nil
@@ -198,6 +207,7 @@ func (pm *ProtocolManager) makeProtocol(version uint) p2p.Protocol {
 		panic("makeProtocol for unknown version")
 	}
 
+	// 创建p2p协议
 	return p2p.Protocol{
 		Name:    protocolName,
 		Version: version,
@@ -205,9 +215,12 @@ func (pm *ProtocolManager) makeProtocol(version uint) p2p.Protocol {
 		Run: func(p *p2p.Peer, rw p2p.MsgReadWriter) error {
 			peer := pm.newPeer(int(version), p, rw)
 			select {
+			// 每当有新的节点到来，都先会把节点对象发给newPeerCh
 			case pm.newPeerCh <- peer:
 				pm.wg.Add(1)
 				defer pm.wg.Done()
+				// protocolManager 处理该节点
+				// 如果该方法返回，则代表这个节点断开了连接
 				return pm.handle(peer)
 			case <-pm.quitSync:
 				return p2p.DiscQuitting
@@ -294,19 +307,24 @@ func (pm *ProtocolManager) newPeer(pv int, p *p2p.Peer, rw p2p.MsgReadWriter) *p
 // this function terminates, the peer is disconnected.
 func (pm *ProtocolManager) handle(p *peer) error {
 	// Ignore maxPeers if this is a trusted peer
+	// 如果是可信节点的话，就忽略最大节点的限制
+	// 可信任的节点是我们自己设置的，可以在js console中通过admin.addTrustedPeer来填加，或者在<datadir>/trusted-nodes.json中设置。
 	if pm.peers.Len() >= pm.maxPeers && !p.Peer.Info().Network.Trusted {
 		return p2p.DiscTooManyPeers
 	}
 	p.Log().Debug("Ethereum peer connected", "name", p.Name())
 
 	// Execute the Ethereum handshake
+	// 以太坊握手
 	var (
 		genesis = pm.blockchain.Genesis()
-		head    = pm.blockchain.CurrentHeader()
-		hash    = head.Hash()
-		number  = head.Number.Uint64()
-		td      = pm.blockchain.GetTd(hash, number)
+		// 当前区块头，区块头hash，区块编号，难度
+		head   = pm.blockchain.CurrentHeader()
+		hash   = head.Hash()
+		number = head.Number.Uint64()
+		td     = pm.blockchain.GetTd(hash, number)
 	)
+	// 握手
 	if err := p.Handshake(pm.networkID, td, hash, genesis.Hash(), forkid.NewID(pm.blockchain), pm.forkFilter); err != nil {
 		p.Log().Debug("Ethereum handshake failed", "err", err)
 		return err
@@ -314,19 +332,24 @@ func (pm *ProtocolManager) handle(p *peer) error {
 	if rw, ok := p.rw.(*meteredMsgReadWriter); ok {
 		rw.Init(p.version)
 	}
+
 	// Register the peer locally
+	// 握手成功，将节点注册到本地
 	if err := pm.peers.Register(p); err != nil {
 		p.Log().Error("Ethereum peer registration failed", "err", err)
 		return err
 	}
+	// 保证异常情况下，移除该节点
 	defer pm.removePeer(p.id)
 
 	// Register the peer in the downloader. If the downloader considers it banned, we disconnect
+	// downloader 中加入该节点
 	if err := pm.downloader.RegisterPeer(p.id, p.version, p); err != nil {
 		return err
 	}
 	// Propagate existing transactions. new transactions appearing
 	// after this will be sent via broadcasts.
+	// 与新的节点同步自己所有的pending状态交易
 	pm.syncTransactions(p)
 
 	// If we have a trusted CHT, reject all peers below that (avoid fast sync eclipse)
@@ -349,12 +372,16 @@ func (pm *ProtocolManager) handle(p *peer) error {
 		}()
 	}
 	// If we have any explicit whitelist block hashes, request them
+	// 请求白名单区块，即认为可信任的区块，在配置文件中whiteList字段中配置
+	// 目的是为了对接入的节点的数据正确性做一个简单的验证
 	for number := range pm.whitelist {
+		// 通过区块号向节点查询区块信息
 		if err := p.RequestHeadersByNumber(number, 1, 0, false); err != nil {
 			return err
 		}
 	}
 	// Handle incoming messages until the connection is torn down
+	// 一直受理连接的信息
 	for {
 		if err := pm.handleMsg(p); err != nil {
 			p.Log().Debug("Ethereum message handling failed", "err", err)
@@ -367,29 +394,36 @@ func (pm *ProtocolManager) handle(p *peer) error {
 // peer. The remote connection is torn down upon returning any error.
 func (pm *ProtocolManager) handleMsg(p *peer) error {
 	// Read the next message from the remote peer, and ensure it's fully consumed
+	// 读消息
 	msg, err := p.rw.ReadMsg()
 	if err != nil {
 		return err
 	}
+	// 消息大小校验，不能超过10M
 	if msg.Size > protocolMaxMsgSize {
 		return errResp(ErrMsgTooLarge, "%v > %v", msg.Size, protocolMaxMsgSize)
 	}
 	defer msg.Discard()
 
 	// Handle the message depending on its contents
+	// 根据消息类型处理消息
 	switch {
+	// 握手时候的消息
 	case msg.Code == StatusMsg:
 		// Status messages should never arrive after the handshake
 		return errResp(ErrExtraStatusMsg, "uncontrolled status message")
 
 	// Block header query, collect the requested headers and reply
+	// 区块头查询消息，查询本地的区块头信息并且回复
 	case msg.Code == GetBlockHeadersMsg:
 		// Decode the complex header query
+		// 解码
 		var query getBlockHeadersData
 		if err := msg.Decode(&query); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
 		hashMode := query.Origin.Hash != (common.Hash{})
+		// 是否是第一次查询，
 		first := true
 		maxNonCanonical := uint64(100)
 
@@ -399,6 +433,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 			headers []*types.Header
 			unknown bool
 		)
+		// 批量查询限制检查
 		for !unknown && len(headers) < int(query.Amount) && bytes < softResponseLimit && len(headers) < downloader.MaxHeaderFetch {
 			// Retrieve the next header satisfying the query
 			var origin *types.Header
@@ -413,6 +448,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 					origin = pm.blockchain.GetHeader(query.Origin.Hash, query.Origin.Number)
 				}
 			} else {
+				// 直接通过Number查会更快
 				origin = pm.blockchain.GetHeaderByNumber(query.Origin.Number)
 			}
 			if origin == nil {
@@ -422,6 +458,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 			bytes += estHeaderRlpSize
 
 			// Advance to the next header of the query
+			// 控制批量区块查询的顺序
 			switch {
 			case hashMode && query.Reverse:
 				// Hash based traversal towards the genesis block
@@ -468,10 +505,12 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 				query.Origin.Number += query.Skip + 1
 			}
 		}
+		// 发送header的消息
 		return p.SendBlockHeaders(headers)
-
+	// 	收到区块头信息
 	case msg.Code == BlockHeadersMsg:
 		// A batch of headers arrived to one of our previous requests
+		// 从消息中解码区块头信息
 		var headers []*types.Header
 		if err := msg.Decode(&headers); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
@@ -500,12 +539,15 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 				p.syncDrop = nil
 
 				// Validate the header and either drop the peer or continue
+				// 验证区块头
 				if headers[0].Hash() != pm.checkpointHash {
 					return errors.New("checkpoint hash mismatch")
 				}
 				return nil
 			}
 			// Otherwise if it's a whitelisted block, validate against the set
+			// 当收到的header只有一个时，就回去判断whiteList
+			// 如果不一致，就直接断开该节点
 			if want, ok := pm.whitelist[headers[0].Number.Uint64()]; ok {
 				if hash := headers[0].Hash(); want != hash {
 					p.Log().Info("Whitelist mismatch, dropping peer", "number", headers[0].Number.Uint64(), "hash", hash, "want", want)
@@ -522,7 +564,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 				log.Debug("Failed to deliver headers", "err", err)
 			}
 		}
-
+	// 	查询区块体消息
 	case msg.Code == GetBlockBodiesMsg:
 		// Decode the retrieval message
 		msgStream := rlp.NewStream(msg.Payload, uint64(msg.Size))
@@ -704,6 +746,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 			trueTD   = new(big.Int).Sub(request.TD, request.Block.Difficulty())
 		)
 		// Update the peer's total difficulty if better than the previous
+		// 收到BlockMsg消息，更新对方的Head数据
 		if _, td := p.Head(); trueTD.Cmp(td) > 0 {
 			p.SetHead(trueHead, trueTD)
 
@@ -743,6 +786,9 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 
 // BroadcastBlock will either propagate a block to a subset of it's peers, or
 // will only announce it's availability (depending what's requested).
+// 广播区块信息，如果propagate为true，会向其他节点发送NewBlockMsg信息，NewBlockMsg可以帮助其他节点更新本地记录的Head数据
+// 1. fetcher模块中将一个同步到的区块加入到本地数据库前，使用这个消息通知其它节点自己的区块有更新；
+// 2. 本地节点的挖矿模块出了一个新的区块时，使用消息将这个新区块发送给自己的其它节点
 func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) {
 	hash := block.Hash()
 	peers := pm.peers.PeersWithoutBlock(hash)
@@ -758,6 +804,7 @@ func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) {
 			return
 		}
 		// Send the block to a subset of our peers
+		// 选取部分的节点发送消息
 		transferLen := int(math.Sqrt(float64(len(peers))))
 		if transferLen < minBroadcastPeers {
 			transferLen = minBroadcastPeers
@@ -801,6 +848,7 @@ func (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) {
 }
 
 // Mined broadcast loop
+// 订阅新挖到的区块信息，并广播新区块
 func (pm *ProtocolManager) minedBroadcastLoop() {
 	// automatically stops if unsubscribe
 	for obj := range pm.minedBlockSub.Chan() {

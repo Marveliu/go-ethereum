@@ -58,10 +58,13 @@ type stateSyncStats struct {
 }
 
 // syncState starts downloading state with the given root hash.
+// 给定根Hash进行同步
 func (d *Downloader) syncState(root common.Hash) *stateSync {
 	// Create the state sync
 	s := newStateSync(d, root)
 	select {
+	// 新的对象发送给 Downloader.stateSyncStart。最后返回这个新的对象。
+	// stateFetcher
 	case d.stateSyncStart <- s:
 	case <-d.quitCh:
 		s.err = errCancelStateFetch
@@ -76,6 +79,7 @@ func (d *Downloader) stateFetcher() {
 	for {
 		select {
 		case s := <-d.stateSyncStart:
+			// 进行同步
 			for next := s; next != nil; {
 				next = d.runStateSync(next)
 			}
@@ -87,14 +91,21 @@ func (d *Downloader) stateFetcher() {
 	}
 }
 
-// runStateSync runs a state synchronisation until it completes or another root
+// runStateSync runs a state synchronisation until
+// it completes or another root
 // hash is requested to be switched over to.
+// 执行状态同步
 func (d *Downloader) runStateSync(s *stateSync) *stateSync {
+
 	var (
-		active   = make(map[string]*stateReq) // Currently in-flight requests
-		finished []*stateReq                  // Completed or failed requests
-		timeout  = make(chan *stateReq)       // Timed out active requests
+		// 正在处理中
+		active = make(map[string]*stateReq) // Currently in-flight requests
+		// 已经完成的 不管成功或者失败
+		finished []*stateReq // Completed or failed requests
+		// 超时
+		timeout = make(chan *stateReq) // Timed out active requests
 	)
+
 	defer func() {
 		// Cancel active request timers on exit. Also set peers to idle so they're
 		// available for the next sync.
@@ -103,8 +114,11 @@ func (d *Downloader) runStateSync(s *stateSync) *stateSync {
 			req.peer.SetNodeDataIdle(len(req.items))
 		}
 	}()
+
+	// 其实代码这么写是为了在同步某个 state 数据的同时，能够及时发现新的 state 同步请求并进行处理，而处理方式就是停掉之前的同步进程
 	// Run the state sync.
 	go s.run()
+	// 方法退出之前，停止同步的动作
 	defer s.Cancel()
 
 	// Listen for peer departure events to cancel assigned tasks
@@ -124,14 +138,19 @@ func (d *Downloader) runStateSync(s *stateSync) *stateSync {
 		}
 
 		select {
+
 		// The stateSync lifecycle:
+		// 同一时间只有一个区块的 state 数据被同步；如果要同步新的 state，需要先停掉旧的同步过程。
+		// 此处收到新的stateSync 直接返回，执行 defer s.Cancel()
 		case next := <-d.stateSyncStart:
 			return next
 
+		// 	区块下载完成
 		case <-s.done:
 			return nil
 
 		// Send the next finished request to the current sync:
+		// finished 集合中的第一个已完成的请求就会发送给 stateSync.deliver
 		case deliverReqCh <- deliverReq:
 			// Shift out the first request, but also set the emptied slot to nil for GC
 			copy(finished, finished[1:])
@@ -139,8 +158,12 @@ func (d *Downloader) runStateSync(s *stateSync) *stateSync {
 			finished = finished[:len(finished)-1]
 
 		// Handle incoming state packs:
+		// 功接收到数据
 		case pack := <-d.stateCh:
+
 			// Discard any data not requested (or previously timed out)
+			// 代码首先判断是否在 active 中。如果在则将返回的数据放到 req.response 中，
+			// 并将 req 写入 finished 中，然后从 active中删除。
 			req := active[pack.PeerId()]
 			if req == nil {
 				log.Debug("Unrequested node data", "peer", pack.PeerId(), "len", pack.Items())
@@ -154,6 +177,7 @@ func (d *Downloader) runStateSync(s *stateSync) *stateSync {
 			delete(active, pack.PeerId())
 
 		// Handle dropped peer connections:
+		// 处理节点断开连接的情况
 		case p := <-peerDrop:
 			// Skip if no request is currently pending
 			req := active[p.id]
@@ -172,6 +196,7 @@ func (d *Downloader) runStateSync(s *stateSync) *stateSync {
 			// If the peer is already requesting something else, ignore the stale timeout.
 			// This can happen when the timeout and the delivery happens simultaneously,
 			// causing both pathways to trigger.
+			// 如果超时的请求在 active 中，则将其从 active 中删除，并将其加入到 finished 中（完成但失败了）。
 			if active[req.peer.id] != req {
 				continue
 			}
@@ -180,6 +205,7 @@ func (d *Downloader) runStateSync(s *stateSync) *stateSync {
 			delete(active, req.peer.id)
 
 		// Track outgoing state requests:
+		// 上代表 stateSync 对象发起了一次请求
 		case req := <-d.trackStateReq:
 			// If an active request already exists for this peer, we have a problem. In
 			// theory the trie node schedule must never assign two requests to the same
@@ -187,6 +213,8 @@ func (d *Downloader) runStateSync(s *stateSync) *stateSync {
 			// immediately reconnect before the previous times out. In this case the first
 			// request is never honored, alas we must not silently overwrite it, as that
 			// causes valid requests to go missing and sync to get stuck.
+			// 首先通过 active 判断这个节点是否有正在处理的请求，如果是则将旧的请求中断并加入finished中（完成但失败了）。
+			// 然后为新的 req 设置一个 timer 后，将 req 加入到 active 中。
 			if old := active[req.peer.id]; old != nil {
 				log.Warn("Busy peer assigned new state fetch", "peer", old.peer.id)
 
@@ -212,6 +240,10 @@ func (d *Downloader) runStateSync(s *stateSync) *stateSync {
 
 // stateSync schedules requests for downloading a particular state trie defined
 // by a given state root.
+// 因为所谓的 state 数据，实际上就是一棵 trie 树，而同步过的过程，就是在同步这棵树上的每一个节点。
+// 在最开始的时候，downloader 只有 trie 树的根哈希（Root），使用这个哈希同步到的就是树的根节点。
+// 那么接下来需要同步的节点的哈希，就需要 trie.Sync 帮忙从这个根结点解析出来（trie 的每个节点会记录子节点的哈希）
+// 然后 downloader 才可以使用这些哈希去同步相应的节点。依此不断进行，直到最底层的叶子节点同完成，整个 trie 树就同步完成了。
 type stateSync struct {
 	d *Downloader // Downloader instance to access and manage current peerset
 
@@ -275,6 +307,7 @@ func (s *stateSync) Cancel() error {
 // receive data from peers, rather those are buffered up in the downloader and
 // pushed here async. The reason is to decouple processing from data receipt
 // and timeouts.
+// 同步过程
 func (s *stateSync) loop() (err error) {
 	// Listen for new peer events to assign tasks to them
 	newPeer := make(chan *peerConnection, 1024)
@@ -305,8 +338,10 @@ func (s *stateSync) loop() (err error) {
 			return errCanceled
 
 		case req := <-s.deliver:
+			// 收到了数据
 			// Response, disconnect or timeout triggered, drop the peer if stalling
 			log.Trace("Received node data response", "peer", req.peer.id, "count", len(req.response), "dropped", req.dropped, "timeout", !req.dropped && req.timedOut())
+			// 规则校验
 			if len(req.items) <= 2 && !req.dropped && req.timedOut() {
 				// 2 items are the minimum requested, if even that times out, we've no use of
 				// this peer at the moment.
@@ -361,6 +396,7 @@ func (s *stateSync) commit(force bool) error {
 
 // assignTasks attempts to assign new tasks to all idle peers, either from the
 // batch currently being retried, or fetching new data from the trie sync itself.
+// 发起同步请求
 func (s *stateSync) assignTasks() {
 	// Iterate over all idle peers and try to assign them state fetches
 	peers, _ := s.d.peers.NodeDataIdlePeers()
@@ -417,6 +453,7 @@ func (s *stateSync) fillTasks(n int, req *stateReq) {
 // into a running state sync, re-queuing any items that were requested but not
 // delivered. Returns whether the peer actually managed to deliver anything of
 // value, and any error that occurred.
+//
 func (s *stateSync) process(req *stateReq) (int, error) {
 	// Collect processing stats and update progress if valid data was received
 	duplicate, unexpected, successful := 0, 0, 0
@@ -428,6 +465,7 @@ func (s *stateSync) process(req *stateReq) (int, error) {
 	}(time.Now())
 
 	// Iterate over all the delivered data and inject one-by-one into the trie
+	// 将数据注入到trie中
 	for _, blob := range req.response {
 		_, hash, err := s.processNodeData(blob)
 		switch err {

@@ -77,15 +77,21 @@ type peer struct {
 	id string
 
 	*p2p.Peer
+	// 消息通道，用于读写
 	rw p2p.MsgReadWriter
 
+	// 协议版本
 	version  int         // Protocol version negotiated
 	syncDrop *time.Timer // Timed connection dropper if sync progress isn't validated in time
 
+	// 对方主链上最新的区块Hash和td
+	// td 用于找到bestPeer
 	head common.Hash
 	td   *big.Int
 	lock sync.RWMutex
 
+	// 对方已经拥有的区块hash和交易hash
+	// 如果其他节点已经有这些hash数据就不再给这些节点进行广播
 	knownTxs    mapset.Set                // Set of transaction hashes known to be known by this peer
 	knownBlocks mapset.Set                // Set of block hashes known to be known by this peer
 	queuedTxs   chan []*types.Transaction // Queue of transactions to broadcast to the peer
@@ -209,13 +215,16 @@ func (p *peer) SendTransactions(txs types.Transactions) error {
 
 // AsyncSendTransactions queues list of transactions propagation to a remote
 // peer. If the peer's broadcast queue is full, the event is silently dropped.
+// 想peer异步发送交易
 func (p *peer) AsyncSendTransactions(txs []*types.Transaction) {
 	select {
 	case p.queuedTxs <- txs:
 		// Mark all the transactions as known, but ensure we don't overflow our limits
+		// 标记已经发送过了
 		for _, tx := range txs {
 			p.knownTxs.Add(tx.Hash())
 		}
+		// 缓存容量调整
 		for p.knownTxs.Cardinality() >= maxKnownTxs {
 			p.knownTxs.Pop()
 		}
@@ -353,7 +362,8 @@ func (p *peer) RequestReceipts(hashes []common.Hash) error {
 }
 
 // Handshake executes the eth protocol handshake, negotiating version number,
-// network IDs, difficulties, head and genesis blocks.
+// network IDs, difficulties, head and genesis blocks
+// 协议握手
 func (p *peer) Handshake(network uint64, td *big.Int, head common.Hash, genesis common.Hash, forkID forkid.ID, forkFilter forkid.Filter) error {
 	// Send out own handshake in a new thread
 	errc := make(chan error, 2)
@@ -362,6 +372,7 @@ func (p *peer) Handshake(network uint64, td *big.Int, head common.Hash, genesis 
 		status63 statusData63 // safe to read after two values have been received from errc
 		status   statusData   // safe to read after two values have been received from errc
 	)
+	// 发送自己的数据给对方
 	go func() {
 		switch {
 		case p.version == eth63:
@@ -385,6 +396,7 @@ func (p *peer) Handshake(network uint64, td *big.Int, head common.Hash, genesis 
 			panic(fmt.Sprintf("unsupported eth protocol version: %d", p.version))
 		}
 	}()
+	// 等待接收对方的消息
 	go func() {
 		switch {
 		case p.version == eth63:
@@ -397,6 +409,8 @@ func (p *peer) Handshake(network uint64, td *big.Int, head common.Hash, genesis 
 	}()
 	timeout := time.NewTimer(handshakeTimeout)
 	defer timeout.Stop()
+	// 等待数据发送和接收都完成，或者超时
+	// 有个for循环2是因为要分别等待和判断发送/接收两个情况
 	for i := 0; i < 2; i++ {
 		select {
 		case err := <-errc:
@@ -407,6 +421,8 @@ func (p *peer) Handshake(network uint64, td *big.Int, head common.Hash, genesis 
 			return p2p.DiscReadTimeout
 		}
 	}
+
+	// 保存td和head
 	switch {
 	case p.version == eth63:
 		p.td, p.head = status63.TD, status63.CurrentBlock
@@ -511,6 +527,7 @@ func (ps *peerSet) Register(p *peer) error {
 		return errAlreadyRegistered
 	}
 	ps.peers[p.id] = p
+	// 异步开启，对该节点的消息广播服务
 	go p.broadcast()
 
 	return nil
@@ -579,6 +596,7 @@ func (ps *peerSet) PeersWithoutTx(hash common.Hash) []*peer {
 }
 
 // BestPeer retrieves the known peer with the currently highest total difficulty.
+// 选择最好的节点，TD 最大
 func (ps *peerSet) BestPeer() *peer {
 	ps.lock.RLock()
 	defer ps.lock.RUnlock()

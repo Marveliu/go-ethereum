@@ -218,6 +218,7 @@ func (f *Fetcher) Enqueue(peer string, block *types.Block) error {
 
 // FilterHeaders extracts all the headers that were explicitly requested by the fetcher,
 // returning those that should be handled differently.
+// 从peer中下载header
 func (f *Fetcher) FilterHeaders(peer string, headers []*types.Header, time time.Time) []*types.Header {
 	log.Trace("Filtering headers", "peer", peer, "headers", len(headers))
 
@@ -633,6 +634,7 @@ func (f *Fetcher) enqueue(peer string, block *types.Block) {
 // insert spawns a new goroutine to run a block insertion into the chain. If the
 // block's number is at the same height as the current import phase, it updates
 // the phase states accordingly.
+// 将区块查询到本地之前，广播将要插入的区块
 func (f *Fetcher) insert(peer string, block *types.Block) {
 	hash := block.Hash()
 

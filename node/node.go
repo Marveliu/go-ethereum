@@ -215,6 +215,7 @@ func (n *Node) Start() error {
 	}
 	// Gather the protocols and start the freshly assembled P2P server
 	for _, service := range services {
+		// 启动协议
 		running.Protocols = append(running.Protocols, service.Protocols()...)
 	}
 	if err := running.Start(); err != nil {

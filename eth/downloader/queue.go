@@ -534,6 +534,7 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 			continue
 		}
 		// Otherwise unless the peer is known not to have the data, add to the retrieve list
+		// 判断节点没有「缺失」这条数据，如果缺失了就暂时跳过这条数据
 		if p.Lacks(hash) {
 			skip = append(skip, header)
 		} else {

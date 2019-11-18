@@ -65,6 +65,7 @@ const (
 // - The memory mapping ensures we can max out system memory for caching without
 //   reserving it for go-ethereum. This would also reduce the memory requirements
 //   of Geth, and thus also GC overhead.
+// freezer 是一个内存映射只追加数据库，为了存储不变的链上数据到文件中
 type freezer struct {
 	// WARNING: The `frozen` field is accessed atomically. On 32 bit platforms, only
 	// 64-bit aligned fields can be atomic. The struct is guaranteed to be so aligned,
