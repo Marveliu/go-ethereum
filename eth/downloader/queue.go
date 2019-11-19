@@ -64,19 +64,24 @@ type fetchResult struct {
 }
 
 // queue represents hashes that are either need fetching or are being fetched
+// 下载器工具类，用于组装，调度下载信息
 type queue struct {
 	mode SyncMode // Synchronisation mode to decide on the block parts to schedule for fetching
 
 	// Headers are "special", they download in batches, supported by a skeleton chain
-	headerHead      common.Hash                    // [eth/62] Hash of the last queued header to verify order
-	headerTaskPool  map[uint64]*types.Header       // [eth/62] Pending header retrieval tasks, mapping starting indexes to skeleton headers
-	headerTaskQueue *prque.Prque                   // [eth/62] Priority queue of the skeleton indexes to fetch the filling headers for
-	headerPeerMiss  map[string]map[uint64]struct{} // [eth/62] Set of per-peer header batches known to be unavailable
-	headerPendPool  map[string]*fetchRequest       // [eth/62] Currently pending header retrieval operations
-	headerResults   []*types.Header                // [eth/62] Result cache accumulating the completed headers
-	headerProced    int                            // [eth/62] Number of headers already processed from the results
-	headerOffset    uint64                         // [eth/62] Number of the first header in the result cache
-	headerContCh    chan bool                      // [eth/62] Channel to notify when header download finishes
+	headerHead      common.Hash              // [eth/62] Hash of the last queued header to verify order
+	headerTaskPool  map[uint64]*types.Header // [eth/62] Pending header retrieval tasks, mapping starting indexes to skeleton headers
+	headerTaskQueue *prque.Prque             // [eth/62] Priority queue of the skeleton indexes to fetch the filling headers for
+	// 记录着节点下载数据失败的信息
+	headerPeerMiss map[string]map[uint64]struct{} // [eth/62] Set of per-peer header batches known to be unavailable
+	// 记录正在下载的节点和数据信息
+	headerPendPool map[string]*fetchRequest // [eth/62] Currently pending header retrieval operations
+	// 下载成功的header
+	headerResults []*types.Header // [eth/62] Result cache accumulating the completed headers
+	// 发送给参数 headerProcCh 的 header 的数量存储在 queue.headerProced
+	headerProced int       // [eth/62] Number of headers already processed from the results
+	headerOffset uint64    // [eth/62] Number of the first header in the result cache
+	headerContCh chan bool // [eth/62] Channel to notify when header download finishes
 
 	// All data retrievals below are based on an already assembles header chain
 	blockTaskPool  map[common.Hash]*types.Header // [eth/62] Pending block (body) retrieval tasks, mapping hashes to headers
@@ -267,6 +272,7 @@ func (q *queue) resultSlots(pendPool map[string]*fetchRequest, donePool map[comm
 
 // ScheduleSkeleton adds a batch of header retrieval tasks to the queue to fill
 // up an already retrieved header skeleton.
+// 填充skeleton
 func (q *queue) ScheduleSkeleton(from uint64, skeleton []*types.Header) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
@@ -286,14 +292,29 @@ func (q *queue) ScheduleSkeleton(from uint64, skeleton []*types.Header) {
 
 	for i, header := range skeleton {
 		index := from + uint64(i*MaxHeaderFetch)
-
+		// 每一组区块中第一个区块的高度到最后一个区块的 header 的映射
+		//
+		// 假设已确定需要下载的区块高度区间是从 10 到 46，MaxHeaderFetch 的值为 10
+		// headerTaskPool = {
+		// 	10: headerOf_19,
+		//  20: headerOf_20,
+		// 	30: headerOf_39,
+		// }
 		q.headerTaskPool[index] = header
+		// 优先级队列，每一项的值为每一组的第一个区块的高度，优先级为此高度的负数。
+		// 因此在这个队列里，高度值越小优先级越高。
+		// headerTaskQueue = {
+		// -10: 10,
+		// -20: 20,
+		// -30: 30,
+		// }
 		q.headerTaskQueue.Push(index, -int64(index))
 	}
 }
 
 // RetrieveHeaders retrieves the header chain assemble based on the scheduled
 // skeleton.
+// 直接返回 queue.headerResults 和 queue.headerProced 两个字段的数据
 func (q *queue) RetrieveHeaders() ([]*types.Header, int) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
@@ -306,6 +327,7 @@ func (q *queue) RetrieveHeaders() ([]*types.Header, int) {
 
 // Schedule adds a set of headers for the download queue for scheduling, returning
 // the new headers encountered.
+// 成功下载header 根据header发起对应的body和receipt的下载
 func (q *queue) Schedule(headers []*types.Header, from uint64) []*types.Header {
 	q.lock.Lock()
 	defer q.lock.Unlock()
@@ -313,6 +335,8 @@ func (q *queue) Schedule(headers []*types.Header, from uint64) []*types.Header {
 	// Insert all the headers prioritised by the contained block number
 	inserts := make([]*types.Header, 0, len(headers))
 	for _, header := range headers {
+
+		// 检查header的正确性，数据是否在队列中
 		// Make sure chain order is honoured and preserved throughout
 		hash := header.Hash()
 		if header.Number == nil || header.Number.Uint64() != from {
@@ -332,10 +356,15 @@ func (q *queue) Schedule(headers []*types.Header, from uint64) []*types.Header {
 			log.Warn("Header already scheduled for receipt fetch", "number", header.Number, "hash", hash)
 			continue
 		}
+
+		// 将信息写入 body 和 receipt队列
 		// Queue the header for content retrieval
+		// 为了记录数据已经被queue处理了
 		q.blockTaskPool[hash] = header
+		// 优先级队列，存放将要下载的数据信息
 		q.blockTaskQueue.Push(header, -int64(header.Number.Uint64()))
 
+		// fast 模式下要下载 receipt 数据，而其它模式下 queue.receiptTaskQueue 是空的。
 		if q.mode == FastSync {
 			q.receiptTaskPool[hash] = header
 			q.receiptTaskQueue.Push(header, -int64(header.Number.Uint64()))
@@ -349,11 +378,13 @@ func (q *queue) Schedule(headers []*types.Header, from uint64) []*types.Header {
 
 // Results retrieves and permanently removes a batch of fetch results from
 // the cache. the result slice will be empty if the queue has been closed.
+// 返回所有目前已经下载完成的数据，将缓存的数据落库
 func (q *queue) Results(block bool) []*fetchResult {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
 	// Count the number of items available for processing
+	// countProcessableItems 返回 queue.resultCache 中已经下载完成的数据的数量
 	nproc := q.countProcessableItems()
 	for nproc == 0 && !q.closed {
 		if !block {
@@ -366,16 +397,21 @@ func (q *queue) Results(block bool) []*fetchResult {
 	if nproc > maxResultsProcess {
 		nproc = maxResultsProcess
 	}
+	// 有数据的情况下，把数据都拷贝到result中
 	results := make([]*fetchResult, nproc)
 	copy(results, q.resultCache[:nproc])
 	if len(results) > 0 {
 		// Mark results as done before dropping them from the cache.
+		// 清除掉被取走的数据，从而为新的数据腾出内存
+		// Downloader.fetchParts 中调用 throttle 参数有意义的关键：如果不清除已经被取走的数据，那么内存占用就会一直增加
+		// 当达到 shouldThrottle 的阈值以后即使进行等待，也等不到内存占用减小了。
 		for _, result := range results {
 			hash := result.Header.Hash()
 			delete(q.blockDonePool, hash)
 			delete(q.receiptDonePool, hash)
 		}
 		// Delete the results from the cache and clear the tail.
+		// 将已经拷贝到 results 中的数据从 resultCache 中清除，同时修正 resultOffset 的值
 		copy(q.resultCache, q.resultCache[nproc:])
 		for i := len(q.resultCache) - nproc; i < len(q.resultCache); i++ {
 			q.resultCache[i] = nil
@@ -384,6 +420,7 @@ func (q *queue) Results(block bool) []*fetchResult {
 		q.resultOffset += uint64(nproc)
 
 		// Recalculate the result item weights to prevent memory exhaustion
+		// 修正resultSize
 		for _, result := range results {
 			size := result.Header.Size()
 			for _, uncle := range result.Uncles {
@@ -419,12 +456,15 @@ func (q *queue) ReserveHeaders(p *peerConnection, count int) *fetchRequest {
 
 	// Short circuit if the peer's already downloading something (sanity check to
 	// not corrupt state)
+	// 判断指定的远程节点（使用 id 标识）是否正在下载，如果是直接返回。
 	if _, ok := q.headerPendPool[p.id]; ok {
 		return nil
 	}
 	// Retrieve a batch of hashes, skipping previously failed ones
+	// 从 task queue 中选择本次请求的起始高度（跳过已经失败了的）
 	send, skip := uint64(0), []uint64{}
 	for send == 0 && !q.headerTaskQueue.Empty() {
+		// 任务从队列中删除，一旦某个节点下载失败，就再也不会让这个节点下载相同的数据
 		from, _ := q.headerTaskQueue.Pop()
 		if q.headerPeerMiss[p.id] != nil {
 			if _, ok := q.headerPeerMiss[p.id][from.(uint64)]; ok {
@@ -435,15 +475,21 @@ func (q *queue) ReserveHeaders(p *peerConnection, count int) *fetchRequest {
 		send = from.(uint64)
 	}
 	// Merge all the skipped batches back
+	// 将跳过的（失败的）任务重新写回 task queue
 	for _, from := range skip {
 		q.headerTaskQueue.Push(from, -int64(from))
 	}
+
 	// Assemble and return the block download request
+	// 新构造的 request 和 节点 id 写入 headerPendPool 中。
 	if send == 0 {
 		return nil
 	}
 	request := &fetchRequest{
 		Peer: p,
+		// From 字段只标记了 skeleton 中当前这一组的起始高度
+		// 而下载数量默认就是 MaxHeaderFetch
+		// fillHeaderSkeleton fetch
 		From: send,
 		Time: time.Now(),
 	}
@@ -488,13 +534,16 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 	pendPool map[string]*fetchRequest, donePool map[common.Hash]struct{}, isNoop func(*types.Header) bool) (*fetchRequest, bool, error) {
 	// Short circuit if the pool has been depleted, or if the peer's already
 	// downloading something (sanity check not to corrupt state)
+	// 如果没有可处理的任务，直接返因
 	if taskQueue.Empty() {
 		return nil, false, nil
 	}
+	// 如果参数给定的节点正在处理相关的数据，直接返回
 	if _, ok := pendPool[p.id]; ok {
 		return nil, false, nil
 	}
-	// Calculate an upper limit on the items we might fetch (i.e. throttling)
+	// Calculate an upper limit on the items we might fetch (i.e. throttling)】
+	// esultSlots 计算 queue 对象中的缓存空间还可以容纳多少条数据
 	space := q.resultSlots(pendPool, donePool)
 
 	// Retrieve a batch of tasks, skipping previously failed ones
@@ -507,6 +556,7 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 		hash := header.Hash()
 
 		// If we're the first to request this task, initialise the result container
+		// 计算当前 header 在 resultCache 中的位置
 		index := int(header.Number.Int64() - int64(q.resultOffset))
 		if index >= len(q.resultCache) || index < 0 {
 			common.Report("index allocation went beyond available resultCache space")
@@ -518,12 +568,17 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 				components = 2
 			}
 			q.resultCache[index] = &fetchResult{
+				// 代表当前区块还有几类数据需要下载
+				// 下载的数据最多有两类：body 和 receipt
+				// full 模式下只需要下载 body 数据，而 fast 模式要多下载一个 receipt 数据
 				Pending: components,
 				Hash:    hash,
 				Header:  header,
 			}
 		}
 		// If this fetch task is a noop, skip this fetch operation
+		// 如果 header 代表的区块是一个空区块（也就是 body 或 receipt 的数据为空），
+		// 那么直接设置这块数据为下载完成，并标记 progress 为 true
 		if isNoop(header) {
 			donePool[hash] = struct{}{}
 			delete(taskPool, hash)
@@ -542,9 +597,12 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 		}
 	}
 	// Merge all the skipped headers back
+	// 所有跳过的数据再次加入 taskQueue
 	for _, header := range skip {
 		taskQueue.Push(header, -int64(header.Number.Uint64()))
 	}
+
+	// 所有数据都下载完成
 	if progress {
 		// Wake Results, resultCache was modified
 		q.active.Signal()
@@ -680,11 +738,13 @@ func (q *queue) expire(timeout time.Duration, pendPool map[string]*fetchRequest,
 // If the headers are accepted, the method makes an attempt to deliver the set
 // of ready headers to the processor to keep the pipeline full. However it will
 // not block to prevent stalling other pending deliveries.
+//
 func (q *queue) DeliverHeaders(id string, headers []*types.Header, headerProcCh chan []*types.Header) (int, error) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
 	// Short circuit if the data was never requested
+	// 节点必须在下载数据
 	request := q.headerPendPool[id]
 	if request == nil {
 		return 0, errNoFetchesPending
@@ -697,6 +757,7 @@ func (q *queue) DeliverHeaders(id string, headers []*types.Header, headerProcCh 
 
 	accepted := len(headers) == MaxHeaderFetch
 	if accepted {
+		// 检查起始区块的高度和哈希
 		if headers[0].Number.Uint64() != request.From {
 			log.Trace("First header broke chain ordering", "peer", id, "number", headers[0].Number, "hash", headers[0].Hash(), request.From)
 			accepted = false
@@ -708,11 +769,13 @@ func (q *queue) DeliverHeaders(id string, headers []*types.Header, headerProcCh 
 	if accepted {
 		for i, header := range headers[1:] {
 			hash := header.Hash()
+			// 检查区块的连续性
 			if want := request.From + 1 + uint64(i); header.Number.Uint64() != want {
 				log.Warn("Header broke chain ordering", "peer", id, "number", header.Number, "hash", hash, "expected", want)
 				accepted = false
 				break
 			}
+			// 检查哈希的连续性
 			if headers[i].Hash() != header.ParentHash {
 				log.Warn("Header broke chain ancestry", "peer", id, "number", header.Number, "hash", hash)
 				accepted = false
@@ -724,20 +787,25 @@ func (q *queue) DeliverHeaders(id string, headers []*types.Header, headerProcCh 
 	if !accepted {
 		log.Trace("Skeleton filling not accepted", "peer", id, "from", request.From)
 
+		// 记录当前节点失败的信息
 		miss := q.headerPeerMiss[id]
 		if miss == nil {
 			q.headerPeerMiss[id] = make(map[uint64]struct{})
 			miss = q.headerPeerMiss[id]
 		}
 		miss[request.From] = struct{}{}
-
+		// 将这组区块的起始高度重新放入任务队列
 		q.headerTaskQueue.Push(request.From, -int64(request.From))
 		return 0, errors.New("delivery not accepted")
 	}
 	// Clean up a successful fetch and try to deliver any sub-results
+	// 填充下载的header信息，从任务池子中删除这些任务
+	// headerOffset 是 queue.Prepare 中初始化的将要下载的区块的起始高度
+	// request.From - q.headerOffset 自然就是 headers 应该在 queue.headerResults
 	copy(q.headerResults[request.From-q.headerOffset:], headers)
 	delete(q.headerTaskPool, request.From)
 
+	// ready 变量就是找出来的那些还没通知过的 header 的数量
 	ready := 0
 	for q.headerProced+ready < len(q.headerResults) && q.headerResults[q.headerProced+ready] != nil {
 		ready += MaxHeaderFetch
@@ -748,6 +816,8 @@ func (q *queue) DeliverHeaders(id string, headers []*types.Header, headerProcCh 
 		copy(process, q.headerResults[q.headerProced:q.headerProced+ready])
 
 		select {
+		// 通知给headerProCh
+		// Downloader.processHeaders 等待的 channel
 		case headerProcCh <- process:
 			log.Trace("Pre-scheduled new headers", "peer", id, "count", len(process), "from", process[0].Number)
 			q.headerProced += len(process)
@@ -755,6 +825,8 @@ func (q *queue) DeliverHeaders(id string, headers []*types.Header, headerProcCh 
 		}
 	}
 	// Check for termination and return
+	// 任务池为空，说有的组都被下载完了
+	// Downloader.fillHeaderSkeleton 中是作为 wakeCh 传给 Downloader.fetchParts
 	if len(q.headerTaskPool) == 0 {
 		q.headerContCh <- false
 	}
@@ -769,6 +841,7 @@ func (q *queue) DeliverBodies(id string, txLists [][]*types.Transaction, uncleLi
 	defer q.lock.Unlock()
 
 	reconstruct := func(header *types.Header, index int, result *fetchResult) error {
+		// 检查hash是否正确，写入fetchResult相关字段
 		if types.DeriveSha(types.Transactions(txLists[index])) != header.TxHash || types.CalcUncleHash(uncleLists[index]) != header.UncleHash {
 			return errInvalidBody
 		}
@@ -801,11 +874,13 @@ func (q *queue) DeliverReceipts(id string, receiptList [][]*types.Receipt) (int,
 // Note, this method expects the queue lock to be already held for writing. The
 // reason the lock is not obtained in here is because the parameters already need
 // to access the queue, so they already need a lock anyway.
+// 从返回队列中提取数据
 func (q *queue) deliver(id string, taskPool map[common.Hash]*types.Header, taskQueue *prque.Prque,
 	pendPool map[string]*fetchRequest, donePool map[common.Hash]struct{}, reqTimer metrics.Timer,
 	results int, reconstruct func(header *types.Header, index int, result *fetchResult) error) (int, error) {
 
 	// Short circuit if the data was never requested
+	// 任务是否存在pending pool 中
 	request := pendPool[id]
 	if request == nil {
 		return 0, errNoFetchesPending
@@ -814,6 +889,7 @@ func (q *queue) deliver(id string, taskPool map[common.Hash]*types.Header, taskQ
 	delete(pendPool, id)
 
 	// If no data items were retrieved, mark them as unavailable for the origin peer
+	// 如果下载数据为0，则把所有此节点此次下载的数据标记为缺失
 	if results == 0 {
 		for _, header := range request.Headers {
 			request.Peer.MarkLacking(header.Hash())
@@ -836,28 +912,35 @@ func (q *queue) deliver(id string, taskPool map[common.Hash]*types.Header, taskQ
 			failure = errInvalidChain
 			break
 		}
+		// 回调函数 reconstruct
+		// queue.DeliverBodies
+		// queue.DeliverReceipt
 		if err := reconstruct(header, i, q.resultCache[index]); err != nil {
 			failure = err
 			break
 		}
 		hash := header.Hash()
 
+		// 处理成功的处理
 		donePool[hash] = struct{}{}
 		q.resultCache[index].Pending--
 		useful = true
 		accepted++
 
 		// Clean up a successful fetch
+		// 清除已经下载完成的任务
 		request.Headers[i] = nil
 		delete(taskPool, hash)
 	}
 	// Return all failed or missing fetches to the queue
+	// 对于失败的任务进行重试
 	for _, header := range request.Headers {
 		if header != nil {
 			taskQueue.Push(header, -int64(header.Number.Uint64()))
 		}
 	}
 	// Wake up Results
+	// 如果有数据被验证通过且写入 queue.resultCache 中了（accepted > 0），那么就要发送 queue.active 消息了。
 	if accepted > 0 {
 		q.active.Signal()
 	}
@@ -874,6 +957,7 @@ func (q *queue) deliver(id string, taskPool map[common.Hash]*types.Header, taskQ
 
 // Prepare configures the result cache to allow accepting and caching inbound
 // fetch results.
+// 设置下载模式和起始区块的高度
 func (q *queue) Prepare(offset uint64, mode SyncMode) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
