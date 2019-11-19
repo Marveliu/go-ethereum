@@ -184,14 +184,17 @@ func (f *Fetcher) Stop() {
 
 // Notify announces the fetcher of the potential availability of a new block in
 // the network.
+// 造了一个 announce 结构，并将其发送给了 Fetcher.notify 这个 channel。
 func (f *Fetcher) Notify(peer string, hash common.Hash, number uint64, time time.Time,
 	headerFetcher headerRequesterFn, bodyFetcher bodyRequesterFn) error {
 	block := &announce{
-		hash:        hash,
-		number:      number,
-		time:        time,
-		origin:      peer,
+		hash:   hash,
+		number: number,
+		time:   time,
+		origin: peer,
+		// 下载Header
 		fetchHeader: headerFetcher,
+		// 下载Body
 		fetchBodies: bodyFetcher,
 	}
 	select {
@@ -218,7 +221,7 @@ func (f *Fetcher) Enqueue(peer string, block *types.Block) error {
 
 // FilterHeaders extracts all the headers that were explicitly requested by the fetcher,
 // returning those that should be handled differently.
-// 从peer中下载header
+// 处理下载的header消息
 func (f *Fetcher) FilterHeaders(peer string, headers []*types.Header, time time.Time) []*types.Header {
 	log.Trace("Filtering headers", "peer", peer, "headers", len(headers))
 
@@ -226,17 +229,20 @@ func (f *Fetcher) FilterHeaders(peer string, headers []*types.Header, time time.
 	filter := make(chan *headerFilterTask)
 
 	select {
+	// 先发一个通信用的 channel 给 headerFilter
 	case f.headerFilter <- filter:
 	case <-f.quit:
 		return nil
 	}
 	// Request the filtering of the header list
+	// 将要过滤的 header 发送给 filter
 	select {
 	case filter <- &headerFilterTask{peer: peer, headers: headers, time: time}:
 	case <-f.quit:
 		return nil
 	}
 	// Retrieve the headers remaining after filtering
+	// 再从 filter 中获取过滤结果
 	select {
 	case task := <-filter:
 		return task.headers
@@ -275,6 +281,7 @@ func (f *Fetcher) FilterBodies(peer string, transactions [][]*types.Transaction,
 
 // Loop is the main fetcher loop, checking and processing various notification
 // events.
+// Fetcher 主要生命周期
 func (f *Fetcher) loop() {
 	// Iterate the block fetching until a quit is requested
 	fetchTimer := time.NewTimer(0)
@@ -282,6 +289,7 @@ func (f *Fetcher) loop() {
 
 	for {
 		// Clean up any expired block fetches
+		// 去掉超时区块
 		for hash, announce := range f.fetching {
 			if time.Since(announce.time) > fetchTimeout {
 				f.forgetHash(hash)
@@ -296,8 +304,11 @@ func (f *Fetcher) loop() {
 				f.queueChangeHook(hash, false)
 			}
 			// If too high up the chain or phase, continue later
+			// 如果高度大于本地最高高度 + 1，则将信息放回队列并结束入库
 			number := op.block.NumberU64()
 			if number > height+1 {
+				// 优先队列，每次都是弹出高度最小的区块
+				// 最小的不符合规则，则不需要继续判断了
 				f.queue.Push(op, -int64(number))
 				if f.queueChangeHook != nil {
 					f.queueChangeHook(hash, true)
@@ -305,10 +316,12 @@ func (f *Fetcher) loop() {
 				break
 			}
 			// Otherwise if fresh and still unknown, try and import
+			// 确保区块不会太旧并且在本地未存储
 			if number+maxUncleDist < height || f.getBlock(hash) != nil {
 				f.forgetBlock(hash)
 				continue
 			}
+			// 存入本地数据库
 			f.insert(op.origin, op.block)
 		}
 		// Wait for an outside event to occur
@@ -321,13 +334,17 @@ func (f *Fetcher) loop() {
 			// A block was announced, make sure the peer isn't DOSing us
 			propAnnounceInMeter.Mark(1)
 
+			// 判断这个节点已经通知的、但是还未下载成功的哈希的数量。
 			count := f.announces[notification.origin] + 1
+			// 如果数量太多，就先不去处理最新的通知了。这样即可以避免进程缓存了太多待下载的区块信息而占用过多内存，也可以防止对方节点不断地恶意发送无效区块。
 			if count > hashLimit {
 				log.Debug("Peer exceeded outstanding announces", "peer", notification.origin, "limit", hashLimit)
 				propAnnounceDOSMeter.Mark(1)
 				break
 			}
 			// If we have a valid block number, check that it's potentially useful
+			// 确保当前通知的这个区块不会太旧（比本地区块高度小 maxUncleDist）
+			// 或太新（比本地区块高度大 maxQueueDist）
 			if notification.number > 0 {
 				if dist := int64(notification.number) - int64(f.chainHeight()); dist < -maxUncleDist || dist > maxQueueDist {
 					log.Debug("Peer discarded announcement", "peer", notification.origin, "number", notification.number, "hash", notification.hash, "distance", dist)
@@ -336,17 +353,20 @@ func (f *Fetcher) loop() {
 				}
 			}
 			// All is well, schedule the announce if block's not yet downloading
+			// 确保当前通知的区块还未开始下载，保证同一个区块没有被重复下载
 			if _, ok := f.fetching[notification.hash]; ok {
 				break
 			}
 			if _, ok := f.completing[notification.hash]; ok {
 				break
 			}
+			// 更新节点的待下载量
 			f.announces[notification.origin] = count
 			f.announced[notification.hash] = append(f.announced[notification.hash], notification)
 			if f.announceChangeHook != nil && len(f.announced[notification.hash]) == 1 {
 				f.announceChangeHook(notification.hash, true)
 			}
+			// 最后如果 Fetcher.announced 中只有刚才新加入的这一个区块信息
 			if len(f.announced) == 1 {
 				f.rescheduleFetch(fetchTimer)
 			}
@@ -360,12 +380,15 @@ func (f *Fetcher) loop() {
 			// A pending import finished, remove all traces of the notification
 			f.forgetHash(hash)
 			f.forgetBlock(hash)
-
+		// 	下载中
 		case <-fetchTimer.C:
 			// At least one block's timer ran out, check for needing retrieval
 			request := make(map[string][]common.Hash)
-
+			// 选择要下载的区块，从 announced 转移到 fetching 中，
+			// 并将要下载的哈希填充到 request 中
 			for hash, announces := range f.announced {
+				// 「可以下载的」条件是区块通知的时间已经过去了 arriveTimeout-gatherSlack 这么长时间，并将相关信息转移到 Fetcher.fetching 中
+				// 区块的状态从「通知」变成了「下载中」
 				if time.Since(announces[0].time) > arriveTimeout-gatherSlack {
 					// Pick a random peer to retrieve from, reset all others
 					announce := announces[rand.Intn(len(announces))]
@@ -379,6 +402,7 @@ func (f *Fetcher) loop() {
 				}
 			}
 			// Send out all block header requests
+			// 发送下载 header 的请求
 			for peer, hashes := range request {
 				log.Trace("Fetching scheduled headers", "peer", peer, "list", hashes)
 
@@ -395,12 +419,14 @@ func (f *Fetcher) loop() {
 				}()
 			}
 			// Schedule the next fetch if blocks are still pending
+			// 重新设置下次的下载发起时间
 			f.rescheduleFetch(fetchTimer)
-
+		// 	发起body下载请求代码
 		case <-completeTimer.C:
 			// At least one header's timer ran out, retrieve everything
 			request := make(map[string][]common.Hash)
 
+			// 从 Fetcher.fetched 中选取将要下载 body 的是信息放入 request 中
 			for hash, announces := range f.fetched {
 				// Pick a random peer to retrieve from, reset all others
 				announce := announces[rand.Intn(len(announces))]
@@ -413,6 +439,7 @@ func (f *Fetcher) loop() {
 				}
 			}
 			// Send out all block body requests
+			// 发送请求
 			for peer, hashes := range request {
 				log.Trace("Fetching scheduled bodies", "peer", peer, "list", hashes)
 
@@ -426,10 +453,13 @@ func (f *Fetcher) loop() {
 			// Schedule the next fetch if blocks are still pending
 			f.rescheduleComplete(completeTimer)
 
+		// 	处理下载的header
 		case filter := <-f.headerFilter:
+
 			// Headers arrived from a remote peer. Extract those that were explicitly
 			// requested by the fetcher, and return everything else so it's delivered
 			// to other parts of the system.
+			// 从filter 变量中取得要过滤的信息 task
 			var task *headerFilterTask
 			select {
 			case task = <-filter:
@@ -440,11 +470,16 @@ func (f *Fetcher) loop() {
 
 			// Split the batch of headers into unknown ones (to return to the caller),
 			// known incomplete ones (requiring body retrievals) and completed blocks.
+			// unknown 代表「未知」，这些区块根本不是 Fetcher 对象发起下载的；
+			// incomplete 代表是 Fetcher 发起下载的区块，但这里只有 header 数据，还需少 body 数据；
+			// complete 也代表是 Fetcher 发起的区块，并且这个区块已经不缺数据可以直接导入本地数据库了。
+			// complete 状态的数据都是空块，因为空区块的 body 为空，不需要下载。
 			unknown, incomplete, complete := []*types.Header{}, []*announce{}, []*types.Block{}
 			for _, header := range task.headers {
 				hash := header.Hash()
 
 				// Filter fetcher-requested headers from other synchronisation algorithms
+				// 判断是否是我们正在下载的 header
 				if announce := f.fetching[hash]; announce != nil && announce.origin == task.peer && f.fetched[hash] == nil && f.completing[hash] == nil && f.queued[hash] == nil {
 					// If the delivered header does not match the promised number, drop the announcer
 					if header.Number.Uint64() != announce.number {
@@ -454,11 +489,15 @@ func (f *Fetcher) loop() {
 						continue
 					}
 					// Only keep if not imported by other means
+					// 判断此区块在本地是否已存在
+					// 为在 Fetcher 发起下载的过程中，downloader 模块可能已经将其下载完成了
 					if f.getBlock(hash) == nil {
 						announce.header = header
 						announce.time = task.time
 
 						// If the block is empty (header only), short circuit into the final import queue
+						// 判断是否是空区块。
+						// 对于空区块，直接加入到 Fetcher.completing 中
 						if header.TxHash == types.DeriveSha(types.Transactions{}) && header.UncleHash == types.CalcUncleHash([]*types.Header{}) {
 							log.Trace("Block empty, skipping body retrieval", "peer", announce.origin, "number", header.Number, "hash", header.Hash())
 
@@ -470,23 +509,28 @@ func (f *Fetcher) loop() {
 							continue
 						}
 						// Otherwise add to the list of blocks needing completion
+						// 非空区块，保存在 incomplete 中
 						incomplete = append(incomplete, announce)
 					} else {
 						log.Trace("Block already imported, discarding header", "peer", announce.origin, "number", header.Number, "hash", header.Hash())
+						// 本地已存在这个区块
 						f.forgetHash(hash)
 					}
 				} else {
 					// Fetcher doesn't know about it, add to the return list
+					// 不是我们想要下载的区块
 					unknown = append(unknown, header)
 				}
 			}
 			headerFilterOutMeter.Mark(int64(len(unknown)))
 			select {
+			// 将 unknown 通知 Fetcher.FilterHeaders
 			case filter <- &headerFilterTask{headers: unknown, time: task.time}:
 			case <-f.quit:
 				return
 			}
 			// Schedule the retrieved headers for body completion
+			// 将 incomplete 加入到 Fetcher.fetched 中
 			for _, announce := range incomplete {
 				hash := announce.header.Hash()
 				if _, ok := f.completing[hash]; ok {
@@ -494,10 +538,12 @@ func (f *Fetcher) loop() {
 				}
 				f.fetched[hash] = append(f.fetched[hash], announce)
 				if len(f.fetched) == 1 {
+					// 重置定时器
 					f.rescheduleComplete(completeTimer)
 				}
 			}
 			// Schedule the header-only blocks for import
+			// 将 complete 加入等待入库的队列中
 			for _, block := range complete {
 				if announce := f.completing[block.Hash()]; announce != nil {
 					f.enqueue(announce.origin, block)
@@ -515,17 +561,23 @@ func (f *Fetcher) loop() {
 			bodyFilterInMeter.Mark(int64(len(task.transactions)))
 
 			blocks := []*types.Block{}
+
+			// 对于每一组数据，查看其 tx 哈希 和 uncle 哈希是否在 Fetcher.queued 中的 header 中
 			for i := 0; i < len(task.transactions) && i < len(task.uncles); i++ {
 				// Match up a body to any possible completion request
 				matched := false
 
 				for hash, announce := range f.completing {
+
 					if f.queued[hash] == nil {
+						// 对于 task 中的每一组数据，计算它们的 transaction 哈希和 uncle 哈希
 						txnHash := types.DeriveSha(types.Transactions(task.transactions[i]))
 						uncleHash := types.CalcUncleHash(task.uncles[i])
 
+						// 判定是否是我们下载的数据
 						if txnHash == announce.header.TxHash && uncleHash == announce.header.UncleHash && announce.origin == task.peer {
 							// Mark the body matched, reassemble if still unknown
+							// 确定是我们发起的下载数据
 							matched = true
 
 							if f.getBlock(hash) == nil {
@@ -549,11 +601,13 @@ func (f *Fetcher) loop() {
 
 			bodyFilterOutMeter.Mark(int64(len(task.transactions)))
 			select {
+			// 留在 task 中的数据返回给 Fetcher.FilterBodies
 			case filter <- task:
 			case <-f.quit:
 				return
 			}
 			// Schedule the retrieved blocks for ordered import
+			// 调用 Fetcher.enqueue 将 blocks 中的所有区块加入到待入库的队列 Fetcher.queue
 			for _, block := range blocks {
 				if announce := f.completing[block.Hash()]; announce != nil {
 					f.enqueue(announce.origin, block)
@@ -564,12 +618,14 @@ func (f *Fetcher) loop() {
 }
 
 // rescheduleFetch resets the specified fetch timer to the next announce timeout.
+// 调整下次fetch的时间
 func (f *Fetcher) rescheduleFetch(fetch *time.Timer) {
 	// Short circuit if no blocks are announced
 	if len(f.announced) == 0 {
 		return
 	}
 	// Otherwise find the earliest expiring announcement
+	// 在通知区块中找到距当前时间最近的通知
 	earliest := time.Now()
 	for _, announces := range f.announced {
 		if earliest.After(announces[0].time) {
@@ -601,6 +657,7 @@ func (f *Fetcher) enqueue(peer string, block *types.Block) {
 	hash := block.Hash()
 
 	// Ensure the peer isn't DOSing us
+	// 确保不会有太多的来自同一个节点的区块等待入库
 	count := f.queues[peer] + 1
 	if count > blockLimit {
 		log.Debug("Discarded propagated block, exceeded allowance", "peer", peer, "number", block.Number(), "hash", hash, "limit", blockLimit)
@@ -608,14 +665,19 @@ func (f *Fetcher) enqueue(peer string, block *types.Block) {
 		f.forgetHash(hash)
 		return
 	}
+
 	// Discard any past or too distant blocks
+	// 确保这个区块不会太久也不会太新
 	if dist := int64(block.NumberU64()) - int64(f.chainHeight()); dist < -maxUncleDist || dist > maxQueueDist {
 		log.Debug("Discarded propagated block, too far away", "peer", peer, "number", block.Number(), "hash", hash, "distance", dist)
 		propBroadcastDropMeter.Mark(1)
 		f.forgetHash(hash)
 		return
 	}
+
 	// Schedule the block for future importing
+	// 最后将区块数据放到了 Fetcher.queue 中。
+	// 注意 Fetcher.queue 是一个优先级队列，它的优先级为高度的负值，所以在 Pop 操作中，高度越小的元素优先级越高，越会被首先弹出。
 	if _, ok := f.queued[hash]; !ok {
 		op := &inject{
 			origin: peer,
@@ -634,6 +696,7 @@ func (f *Fetcher) enqueue(peer string, block *types.Block) {
 // insert spawns a new goroutine to run a block insertion into the chain. If the
 // block's number is at the same height as the current import phase, it updates
 // the phase states accordingly.
+// 插入区块
 // 将区块查询到本地之前，广播将要插入的区块
 func (f *Fetcher) insert(peer string, block *types.Block) {
 	hash := block.Hash()
