@@ -26,7 +26,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -39,7 +38,7 @@ func TestDeriveSha(t *testing.T) {
 		t.Fatal(err)
 	}
 	for len(txs) < 1000 {
-		exp := types.DeriveSha(txs, trie.NewEmpty(trie.NewDatabase(rawdb.NewMemoryDatabase(), nil)))
+		exp := types.DeriveSha(txs, trie.NewListHasher())
 		got := types.DeriveSha(txs, trie.NewStackTrie(nil))
 		if !bytes.Equal(got[:], exp[:]) {
 			t.Fatalf("%d txs: got %x exp %x", len(txs), got, exp)
@@ -75,31 +74,45 @@ func TestEIP2718DeriveSha(t *testing.T) {
 	}
 }
 
+// goos: darwin
+// goarch: arm64
+// pkg: github.com/ethereum/go-ethereum/core/types
+// cpu: Apple M1 Pro
+// BenchmarkDeriveSha200
+// BenchmarkDeriveSha200/std_trie
+// BenchmarkDeriveSha200/std_trie-8         	    6754	    174074 ns/op	   80054 B/op	    1926 allocs/op
+// BenchmarkDeriveSha200/stack_trie
+// BenchmarkDeriveSha200/stack_trie-8       	    7296	    162675 ns/op	     745 B/op	      19 allocs/op
 func BenchmarkDeriveSha200(b *testing.B) {
 	txs, err := genTxs(200)
 	if err != nil {
 		b.Fatal(err)
 	}
-	var exp common.Hash
-	var got common.Hash
+	want := types.DeriveSha(txs, trie.NewListHasher())
+
 	b.Run("std_trie", func(b *testing.B) {
-		b.ResetTimer()
 		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			exp = types.DeriveSha(txs, trie.NewEmpty(trie.NewDatabase(rawdb.NewMemoryDatabase(), nil)))
+		var have common.Hash
+		for b.Loop() {
+			have = types.DeriveSha(txs, trie.NewListHasher())
+		}
+		if have != want {
+			b.Errorf("have %x want %x", have, want)
 		}
 	})
 
+	st := trie.NewStackTrie(nil)
 	b.Run("stack_trie", func(b *testing.B) {
-		b.ResetTimer()
 		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			got = types.DeriveSha(txs, trie.NewStackTrie(nil))
+		var have common.Hash
+		for b.Loop() {
+			st.Reset()
+			have = types.DeriveSha(txs, st)
+		}
+		if have != want {
+			b.Errorf("have %x want %x", have, want)
 		}
 	})
-	if got != exp {
-		b.Errorf("got %x exp %x", got, exp)
-	}
 }
 
 func TestFuzzDeriveSha(t *testing.T) {
@@ -107,10 +120,10 @@ func TestFuzzDeriveSha(t *testing.T) {
 	rndSeed := mrand.Int()
 	for i := 0; i < 10; i++ {
 		seed := rndSeed + i
-		exp := types.DeriveSha(newDummy(i), trie.NewEmpty(trie.NewDatabase(rawdb.NewMemoryDatabase(), nil)))
+		exp := types.DeriveSha(newDummy(i), trie.NewListHasher())
 		got := types.DeriveSha(newDummy(i), trie.NewStackTrie(nil))
 		if !bytes.Equal(got[:], exp[:]) {
-			printList(newDummy(seed))
+			printList(t, newDummy(seed))
 			t.Fatalf("seed %d: got %x exp %x", seed, got, exp)
 		}
 	}
@@ -135,7 +148,7 @@ func TestDerivableList(t *testing.T) {
 		},
 	}
 	for i, tc := range tcs[1:] {
-		exp := types.DeriveSha(flatList(tc), trie.NewEmpty(trie.NewDatabase(rawdb.NewMemoryDatabase(), nil)))
+		exp := types.DeriveSha(flatList(tc), trie.NewListHasher())
 		got := types.DeriveSha(flatList(tc), trie.NewStackTrie(nil))
 		if !bytes.Equal(got[:], exp[:]) {
 			t.Fatalf("case %d: got %x exp %x", i, got, exp)
@@ -191,15 +204,21 @@ func (d *dummyDerivableList) EncodeIndex(i int, w *bytes.Buffer) {
 	io.CopyN(w, mrand.New(src), size)
 }
 
-func printList(l types.DerivableList) {
-	fmt.Printf("list length: %d\n", l.Len())
-	fmt.Printf("{\n")
+func printList(t *testing.T, l types.DerivableList) {
+	var buf bytes.Buffer
+	_, _ = fmt.Fprintf(&buf, "list length: %d, ", l.Len())
+	buf.WriteString("list: [")
 	for i := 0; i < l.Len(); i++ {
-		var buf bytes.Buffer
-		l.EncodeIndex(i, &buf)
-		fmt.Printf("\"%#x\",\n", buf.Bytes())
+		var itemBuf bytes.Buffer
+		l.EncodeIndex(i, &itemBuf)
+		if i == l.Len()-1 {
+			_, _ = fmt.Fprintf(&buf, "\"%#x\"", itemBuf.Bytes())
+		} else {
+			_, _ = fmt.Fprintf(&buf, "\"%#x\",", itemBuf.Bytes())
+		}
 	}
-	fmt.Printf("},\n")
+	buf.WriteString("]")
+	t.Log(buf.String())
 }
 
 type flatList []string
@@ -227,4 +246,52 @@ func (d *hashToHumanReadable) Update(i []byte, i2 []byte) error {
 
 func (d *hashToHumanReadable) Hash() common.Hash {
 	return common.Hash{}
+}
+
+// TestListHashStream checks that a list fed to the hasher one element at a time
+// ends up with the hash DeriveSha computes for it in one pass.
+func TestListHashStream(t *testing.T) {
+	for _, n := range []int{0, 1, 2, 126, 127, 128, 129, 130, 256, 300} {
+		var (
+			receipts = makeStreamReceipts(n)
+			stream   = types.NewListHashStream(trie.NewStackTrie(nil))
+			fed      = make(types.Receipts, 0, n)
+		)
+		for _, receipt := range receipts {
+			fed = append(fed, receipt)
+			stream.Update(fed)
+		}
+		want := types.DeriveSha(receipts, trie.NewStackTrie(nil))
+		if have := stream.Hash(); have != want {
+			t.Errorf("%d receipts: streamed hash %x, want %x", n, have, want)
+		}
+	}
+}
+
+// makeStreamReceipts builds n receipts of mixed type, some without logs, some
+// with a few, so that the encoding of every receipt differs.
+func makeStreamReceipts(n int) types.Receipts {
+	txTypes := []uint8{types.LegacyTxType, types.AccessListTxType, types.DynamicFeeTxType, types.BlobTxType, types.SetCodeTxType}
+
+	receipts := make(types.Receipts, 0, n)
+	for i := range n {
+		receipt := &types.Receipt{
+			Type:              txTypes[i%len(txTypes)],
+			Status:            uint64(i % 2),
+			CumulativeGasUsed: uint64(i) * 21000,
+		}
+		for j := range i % 4 {
+			log := &types.Log{
+				Address: common.BytesToAddress(crypto.Keccak256([]byte{byte(i), byte(j)})),
+				Data:    crypto.Keccak256([]byte{byte(j)}),
+			}
+			for k := range j {
+				log.Topics = append(log.Topics, crypto.Keccak256Hash([]byte{byte(i), byte(j), byte(k)}))
+			}
+			receipt.Logs = append(receipt.Logs, log)
+		}
+		receipt.Bloom = types.CreateBloom(receipt)
+		receipts = append(receipts, receipt)
+	}
+	return receipts
 }

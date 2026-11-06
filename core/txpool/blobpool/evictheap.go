@@ -17,10 +17,10 @@
 package blobpool
 
 import (
-	"bytes"
 	"container/heap"
+	"maps"
 	"math"
-	"sort"
+	"slices"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/holiman/uint256"
@@ -30,12 +30,15 @@ import (
 // transaction from each account to determine which account to evict from.
 //
 // The heap internally tracks a slice of cheapest transactions from each account
-// and a mapping from addresses to indices for direct removals/udates.
+// and a mapping from addresses to indices for direct removals/updates.
 //
 // The goal of the heap is to decide which account has the worst bottleneck to
 // evict transactions from.
 type evictHeap struct {
-	metas *map[common.Address][]*blobTxMeta // Pointer to the blob pool's index for price retrievals
+	metas   map[common.Address][]*blobTxMeta // Pointer to the blob pool's index for price retrievals
+	blocked map[common.Address]uint64        // Pointer to the blob pool's per-account blocked byte counts
+
+	blockedFirst bool // Whether blocked accounts rank cheaper than non-blocked ones
 
 	basefeeJumps float64 // Pre-calculated absolute dynamic fee jumps for the base fee
 	blobfeeJumps float64 // Pre-calculated absolute dynamic fee jumps for the blob fee
@@ -46,26 +49,35 @@ type evictHeap struct {
 
 // newPriceHeap creates a new heap of cheapest accounts in the blob pool to evict
 // from in case of over saturation.
-func newPriceHeap(basefee *uint256.Int, blobfee *uint256.Int, index *map[common.Address][]*blobTxMeta) *evictHeap {
+func newPriceHeap(basefee *uint256.Int, blobfee *uint256.Int, index map[common.Address][]*blobTxMeta, blocked map[common.Address]uint64) *evictHeap {
 	heap := &evictHeap{
-		metas: index,
-		index: make(map[common.Address]int),
+		metas:   index,
+		blocked: blocked,
+		index:   make(map[common.Address]int, len(index)),
 	}
 	// Populate the heap in account sort order. Not really needed in practice,
 	// but it makes the heap initialization deterministic and less annoying to
 	// test in unit tests.
-	addrs := make([]common.Address, 0, len(*index))
-	for addr := range *index {
-		addrs = append(addrs, addr)
-	}
-	sort.Slice(addrs, func(i, j int) bool { return bytes.Compare(addrs[i][:], addrs[j][:]) < 0 })
-
-	for _, addr := range addrs {
-		heap.index[addr] = len(heap.addrs)
-		heap.addrs = append(heap.addrs, addr)
+	heap.addrs = slices.SortedFunc(maps.Keys(index), common.Address.Cmp)
+	for i, addr := range heap.addrs {
+		heap.index[addr] = i
 	}
 	heap.reinit(basefee, blobfee, true)
 	return heap
+}
+
+// setBlockedFirst switches the heap between fee-only ordering and blocked-first
+// ordering. Blocked-first is only meant to be enabled while the pool's blocked
+// data cap is exceeded, so that eviction drains blocked transactions when they
+// are the resource being overused, but remains a pure fee market when the
+// overall data cap is the limit being enforced. Flipping the mode changes the
+// comparison function, so the heap invariants are re-established on change.
+func (h *evictHeap) setBlockedFirst(on bool) {
+	if h.blockedFirst == on {
+		return
+	}
+	h.blockedFirst = on
+	heap.Init(h)
 }
 
 // reinit updates the pre-calculated dynamic fee jumps in the price heap and runs
@@ -73,7 +85,7 @@ func newPriceHeap(basefee *uint256.Int, blobfee *uint256.Int, index *map[common.
 func (h *evictHeap) reinit(basefee *uint256.Int, blobfee *uint256.Int, force bool) {
 	// If the update is mostly the same as the old, don't sort pointlessly
 	basefeeJumps := dynamicFeeJumps(basefee)
-	blobfeeJumps := dynamicFeeJumps(blobfee)
+	blobfeeJumps := dynamicBlobFeeJumps(blobfee)
 
 	if !force && math.Abs(h.basefeeJumps-basefeeJumps) < 0.01 && math.Abs(h.blobfeeJumps-blobfeeJumps) < 0.01 { // TODO(karalabe): 0.01 enough, maybe should be smaller? Maybe this optimization is moot?
 		return
@@ -94,20 +106,24 @@ func (h *evictHeap) Len() int {
 // Less implements sort.Interface as part of heap.Interface, returning which of
 // the two requested accounts has a cheaper bottleneck.
 func (h *evictHeap) Less(i, j int) bool {
-	txsI := (*(h.metas))[h.addrs[i]]
-	txsJ := (*(h.metas))[h.addrs[j]]
+	if h.blockedFirst {
+		blockedI := h.blocked[h.addrs[i]] > 0
+		blockedJ := h.blocked[h.addrs[j]] > 0
+		if blockedI != blockedJ {
+			// While the blocked cap is exceeded, blocked accounts are
+			// considered cheaper than any non-blocked account. Accounts
+			// in the same class are compared by fees below.
+			return blockedI
+		}
+	}
+	txsI := h.metas[h.addrs[i]]
+	txsJ := h.metas[h.addrs[j]]
 
 	lastI := txsI[len(txsI)-1]
 	lastJ := txsJ[len(txsJ)-1]
 
 	prioI := evictionPriority(h.basefeeJumps, lastI.evictionExecFeeJumps, h.blobfeeJumps, lastI.evictionBlobFeeJumps)
-	if prioI > 0 {
-		prioI = 0
-	}
 	prioJ := evictionPriority(h.basefeeJumps, lastJ.evictionExecFeeJumps, h.blobfeeJumps, lastJ.evictionBlobFeeJumps)
-	if prioJ > 0 {
-		prioJ = 0
-	}
 	if prioI == prioJ {
 		return lastI.evictionExecTip.Lt(lastJ.evictionExecTip)
 	}

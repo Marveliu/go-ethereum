@@ -21,7 +21,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
-	"github.com/ethereum/go-ethereum/log"
 )
 
 // bodyQueue implements typedQueue and is a type adapter between the generic
@@ -38,6 +37,12 @@ func (q *bodyQueue) waker() chan bool {
 // by the concurrent downloader.
 func (q *bodyQueue) pending() int {
 	return q.queue.PendingBodies()
+}
+
+// next returns the number of the block at the head of the body retrieval
+// queue, false if none is pending.
+func (q *bodyQueue) next() (uint64, bool) {
+	return q.queue.NextBody()
 }
 
 // capacity is responsible for calculating how many bodies a particular peer is
@@ -58,17 +63,10 @@ func (q *bodyQueue) reserve(peer *peerConnection, items int) (*fetchRequest, boo
 	return q.queue.ReserveBodies(peer, items)
 }
 
-// unreserve is responsible for removing the current body retrieval allocation
-// assigned to a specific peer and placing it back into the pool to allow
-// reassigning to some other peer.
-func (q *bodyQueue) unreserve(peer string) int {
-	fails := q.queue.ExpireBodies(peer)
-	if fails > 2 {
-		log.Trace("Body delivery timed out", "peer", peer)
-	} else {
-		log.Debug("Body delivery stalling", "peer", peer)
-	}
-	return fails
+// requeue is responsible for placing the current body retrieval allocation of a
+// specific peer back into the pool for some other peer to retrieve as well.
+func (q *bodyQueue) requeue(peer string) {
+	q.queue.RequeueBodies(peer)
 }
 
 // request is responsible for converting a generic fetch request into a body
@@ -78,7 +76,6 @@ func (q *bodyQueue) request(peer *peerConnection, req *fetchRequest, resCh chan 
 	if q.bodyFetchHook != nil {
 		q.bodyFetchHook(req.Headers)
 	}
-
 	hashes := make([]common.Hash, 0, len(req.Headers))
 	for _, header := range req.Headers {
 		hashes = append(hashes, header.Hash())
@@ -89,17 +86,28 @@ func (q *bodyQueue) request(peer *peerConnection, req *fetchRequest, resCh chan 
 // deliver is responsible for taking a generic response packet from the concurrent
 // fetcher, unpacking the body data and delivering it to the downloader's queue.
 func (q *bodyQueue) deliver(peer *peerConnection, packet *eth.Response) (int, error) {
-	txs, uncles, withdrawals := packet.Res.(*eth.BlockBodiesResponse).Unpack()
-	hashsets := packet.Meta.([][]common.Hash) // {txs hashes, uncle hashes, withdrawal hashes}
-
-	accepted, err := q.queue.DeliverBodies(peer.id, txs, hashsets[0], uncles, hashsets[1], withdrawals, hashsets[2])
+	resp := packet.Res.(*eth.BlockBodiesResponse)
+	meta := packet.Meta.(eth.BlockBodyHashes)
+	accepted, err := q.queue.DeliverBodies(peer.id, meta, *resp)
 	switch {
-	case err == nil && len(txs) == 0:
+	case err == nil && len(*resp) == 0:
 		peer.log.Trace("Requested bodies delivered")
 	case err == nil:
-		peer.log.Trace("Delivered new batch of bodies", "count", len(txs), "accepted", accepted)
+		peer.log.Trace("Delivered new batch of bodies", "count", len(*resp), "accepted", accepted)
 	default:
 		peer.log.Debug("Failed to deliver retrieved bodies", "err", err)
 	}
 	return accepted, err
+}
+
+// stalled returns the peer whose body request holds the head of the result
+// cache for longer than the given threshold, blocking the consumer.
+func (q *bodyQueue) stalled(threshold time.Duration) string {
+	return q.queue.StalledBodies(threshold)
+}
+
+// metrics returns the collectors the concurrent fetcher reports the scheduling
+// state of body retrievals into.
+func (q *bodyQueue) metrics() *fetchMetrics {
+	return bodyFetchMetrics
 }

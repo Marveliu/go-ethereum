@@ -18,6 +18,7 @@
 package msgrate
 
 import (
+	"context"
 	"errors"
 	"math"
 	"sort"
@@ -170,8 +171,7 @@ func (t *Tracker) Capacity(kind uint64, targetRTT time.Duration) int {
 // roundCapacity gives the integer value of a capacity.
 // The result fits int32, and is guaranteed to be positive.
 func roundCapacity(cap float64) int {
-	const maxInt32 = float64(1<<31 - 1)
-	return int(math.Min(maxInt32, math.Max(1, math.Ceil(cap))))
+	return int(min(math.MaxInt32, max(1, math.Ceil(cap))))
 }
 
 // Update modifies the peer's capacity values for a specific data type with a new
@@ -226,6 +226,10 @@ type Trackers struct {
 	// run every now and again.
 	tuned time.Time
 
+	// minRoundTrip is the floor applied to the round trip estimate, and thus
+	// to the request sizing and timeouts derived from it.
+	minRoundTrip time.Duration
+
 	// The fields below can be used to override certain default values. Their
 	// purpose is to allow quicker tests. Don't use them in production.
 	OverrideTTLLimit time.Duration
@@ -235,12 +239,16 @@ type Trackers struct {
 }
 
 // NewTrackers creates an empty set of trackers to be filled with peers.
-func NewTrackers(log log.Logger) *Trackers {
+func NewTrackers(log log.Logger, minRoundTrip time.Duration) *Trackers {
+	if minRoundTrip <= 0 {
+		minRoundTrip = rttMinEstimate
+	}
 	return &Trackers{
 		trackers:         make(map[string]*Tracker),
 		roundtrip:        rttMaxEstimate,
 		confidence:       1,
 		tuned:            time.Now(),
+		minRoundTrip:     minRoundTrip,
 		OverrideTTLLimit: ttlLimit,
 		log:              log,
 	}
@@ -306,8 +314,8 @@ func (t *Trackers) medianRoundTrip() time.Duration {
 		median = time.Duration(rtts[idx])
 	}
 	// Restrict the RTT into some QoS defaults, irrelevant of true RTT
-	if median < rttMinEstimate {
-		median = rttMinEstimate
+	if median < t.minRoundTrip {
+		median = t.minRoundTrip
 	}
 	if median > rttMaxEstimate {
 		median = rttMaxEstimate
@@ -410,7 +418,9 @@ func (t *Trackers) tune() {
 
 	t.tuned = time.Now()
 	t.log.Debug("Recalculated msgrate QoS values", "rtt", t.roundtrip, "confidence", t.confidence, "ttl", t.targetTimeout(), "next", t.tuned.Add(t.roundtrip))
-	t.log.Trace("Debug dump of mean capacities", "caps", log.Lazy{Fn: t.meanCapacities})
+	if t.log.Enabled(context.Background(), log.LevelTrace) {
+		t.log.Trace("Debug dump of mean capacities", "caps", t.meanCapacities())
+	}
 }
 
 // detune reduces the tracker's confidence in order to make fresh measurements

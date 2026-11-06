@@ -24,12 +24,20 @@ Usage: go run build/ci.go <command> <command flags/arguments>
 
 Available commands are:
 
-	install    [ -arch architecture ] [ -cc compiler ] [ packages... ]                          -- builds packages and executables
-	test       [ -coverage ] [ packages... ]                                                    -- runs the tests
-	lint                                                                                        -- runs certain pre-selected linters
+	lint           -- runs certain pre-selected linters
+	check_generate -- verifies that 'go generate' and 'go mod tidy' do not produce changes
+	check_baddeps  -- verifies that certain dependencies are avoided
+
+	install    [ -arch architecture ] [ -cc compiler ] [ packages... ] -- builds packages and executables
+	test       [ -coverage ] [ packages... ]                           -- runs the tests
+
+	keeper     [ -dlgo ]
+	keeper-archive [ -signer key-envvar ] [ -signify key-envvar ] [ -upload dest ]
+
 	archive    [ -arch architecture ] [ -type zip|tar ] [ -signer key-envvar ] [ -signify key-envvar ] [ -upload dest ] -- archives build artifacts
 	importkeys                                                                                  -- imports signing keys from env
 	debsrc     [ -signer key-id ] [ -upload dest ]                                              -- creates a debian source package
+	rpmsrc     [ -packager name ] [ -upload copr-project ]                                      -- creates a source RPM for Fedora
 	nsis                                                                                        -- creates a Windows NSIS installer
 	purge      [ -store blobstore ] [ -days threshold ]                                         -- purges old archives from the blobstore
 
@@ -48,7 +56,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
 
@@ -56,36 +64,71 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto/signify"
 	"github.com/ethereum/go-ethereum/internal/build"
-	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/internal/download"
+	"github.com/ethereum/go-ethereum/internal/version"
 )
 
 var (
-	// Files that end up in the geth*.zip archive.
-	gethArchiveFiles = []string{
-		"COPYING",
-		executablePath("geth"),
+	goModules = []string{
+		".",
+		"./cmd/keeper",
 	}
 
-	// Files that end up in the geth-alltools*.zip archive.
-	allToolsArchiveFiles = []string{
-		"COPYING",
-		executablePath("abigen"),
-		executablePath("bootnode"),
-		executablePath("evm"),
-		executablePath("geth"),
-		executablePath("rlpdump"),
-		executablePath("clef"),
+	// Files that end up in the geth-alltools*.zip archive (and the NSIS installer
+	// dev-tools section). Order matches the historical layout produced by ci.go.
+	allToolsBinaries = []string{"abigen", "evm", "geth", "rlpdump"}
+
+	// Keeper build targets with their configurations
+	keeperTargets = []struct {
+		Name   string
+		GOOS   string
+		GOARCH string
+		CC     string
+		Tags   string
+		Env    map[string]string
+	}{
+		{
+			Name:   "ziren",
+			GOOS:   "linux",
+			GOARCH: "mipsle",
+			// enable when cgo works
+			// CC:     "mipsel-linux-gnu-gcc",
+			Tags: "ziren",
+			Env:  map[string]string{"GOMIPS": "softfloat", "CGO_ENABLED": "0"},
+		},
+		{
+			Name:   "womir",
+			GOOS:   "wasip1",
+			GOARCH: "wasm",
+			Tags:   "womir",
+		},
+		{
+			Name:   "zisk",
+			GOOS:   "wasip1",
+			GOARCH: "wasm",
+			Tags:   "zisk",
+		},
+		{
+			Name:   "wasm-js",
+			GOOS:   "js",
+			GOARCH: "wasm",
+		},
+		{
+			Name:   "wasm-wasi",
+			GOOS:   "wasip1",
+			GOARCH: "wasm",
+		},
+		{
+			Name: "example",
+			Tags: "example",
+		},
 	}
 
-	// A debian package is created for all executables listed here.
-	debExecutables = []debExecutable{
+	// A distro package is created for all executables listed here.
+	distroExecutables = []distroExecutable{
 		{
 			BinaryName:  "abigen",
 			Description: "Source code generator to convert Ethereum contract definitions into easy to use, compile-time type-safe Go packages.",
-		},
-		{
-			BinaryName:  "bootnode",
-			Description: "Ethereum bootnode.",
 		},
 		{
 			BinaryName:  "evm",
@@ -99,41 +142,51 @@ var (
 			BinaryName:  "rlpdump",
 			Description: "Developer utility tool that prints RLP structures.",
 		},
-		{
-			BinaryName:  "clef",
-			Description: "Ethereum account management tool.",
-		},
 	}
 
-	// A debian package is created for all executables listed here.
-	debEthereum = debPackage{
+	// The metapackage produced for every packaging format we support.
+	ethereumPackage = distroPackage{
 		Name:        "ethereum",
-		Version:     params.Version,
-		Executables: debExecutables,
+		Version:     version.Semantic,
+		Executables: distroExecutables,
 	}
 
 	// Debian meta packages to build and push to Ubuntu PPA
-	debPackages = []debPackage{
-		debEthereum,
+	debPackages = []distroPackage{
+		ethereumPackage,
 	}
 
-	// Distros for which packages are created.
-	// Note: vivid is unsupported because there is no golang-1.6 package for it.
-	// Note: the following Ubuntu releases have been officially deprecated on Launchpad:
-	//   wily, yakkety, zesty, artful, cosmic, disco, eoan, groovy, hirsuite, impish,
-	//   kinetic
-	debDistroGoBoots = map[string]string{
-		"trusty": "golang-1.11", // EOL: 04/2024
-		"xenial": "golang-go",   // EOL: 04/2026
-		"bionic": "golang-go",   // EOL: 04/2028
-		"focal":  "golang-go",   // EOL: 04/2030
-		"jammy":  "golang-go",   // EOL: 04/2032
-		"lunar":  "golang-go",   // EOL: 01/2024
+	// RPM meta packages to build and push to Fedora COPR
+	rpmPackages = []distroPackage{
+		ethereumPackage,
 	}
 
-	debGoBootPaths = map[string]string{
-		"golang-1.11": "/usr/lib/go-1.11",
-		"golang-go":   "/usr/lib/go",
+	// Distros for which packages are created
+	debDistros = []string{
+		"xenial",    // 16.04, EOL: 04/2026
+		"bionic",    // 18.04, EOL: 04/2028
+		"focal",     // 20.04, EOL: 04/2030
+		"jammy",     // 22.04, EOL: 04/2032
+		"noble",     // 24.04, EOL: 04/2034
+		"resolute",  // 26.04, EOL: 04/2036
+	}
+
+	// COPR chroots the source RPM is built for. The builder Go is shipped in the
+	// source package, so the only requirement on a chroot is a Go able to
+	// bootstrap it; releases are dropped from this list once COPR retires them.
+	fedoraChroots = []string{
+		"fedora-43-x86_64",
+		"fedora-43-aarch64",
+		"fedora-43-riscv64",
+		"fedora-44-x86_64",
+		"fedora-44-aarch64",
+		"fedora-44-riscv64",
+		"fedora-45-x86_64",
+		"fedora-45-aarch64",
+		"fedora-45-riscv64",
+		"fedora-rawhide-x86_64",
+		"fedora-rawhide-aarch64",
+		"fedora-rawhide-riscv64",
 	}
 
 	// This is where the tests should be unpacked.
@@ -142,11 +195,33 @@ var (
 
 var GOBIN, _ = filepath.Abs(filepath.Join("build", "bin"))
 
-func executablePath(name string) string {
-	if runtime.GOOS == "windows" {
+// executablePath returns the path to a built binary in GOBIN, applying the
+// platform-specific extension for the given target OS.
+func executablePath(name, targetOS string) string {
+	if targetOS == "windows" {
 		name += ".exe"
 	}
 	return filepath.Join(GOBIN, name)
+}
+
+// gethArchiveFiles returns the file list for the geth-{platform}-{ver}.zip
+// archive, with binary paths resolved for the target OS.
+func gethArchiveFiles(targetOS string) []string {
+	return []string{
+		"COPYING",
+		executablePath("geth", targetOS),
+	}
+}
+
+// allToolsArchiveFiles returns the file list for the
+// geth-alltools-{platform}-{ver}.zip archive, with binary paths resolved for
+// the target OS.
+func allToolsArchiveFiles(targetOS string) []string {
+	files := []string{"COPYING"}
+	for _, name := range allToolsBinaries {
+		files = append(files, executablePath(name, targetOS))
+	}
+	return files
 }
 
 func main() {
@@ -165,18 +240,28 @@ func main() {
 		doTest(os.Args[2:])
 	case "lint":
 		doLint(os.Args[2:])
+	case "check_generate":
+		doCheckGenerate()
+	case "check_baddeps":
+		doCheckBadDeps()
 	case "archive":
 		doArchive(os.Args[2:])
-	case "docker":
-		doDocker(os.Args[2:])
+	case "dockerx":
+		doDockerBuildx(os.Args[2:])
 	case "debsrc":
 		doDebianSource(os.Args[2:])
+	case "rpmsrc":
+		doRPMSource(os.Args[2:])
 	case "nsis":
 		doWindowsInstaller(os.Args[2:])
 	case "purge":
 		doPurge(os.Args[2:])
 	case "sanitycheck":
 		doSanityCheck()
+	case "keeper":
+		doInstallKeeper(os.Args[2:])
+	case "keeper-archive":
+		doKeeperArchive(os.Args[2:])
 	default:
 		log.Fatal("unknown command ", os.Args[1])
 	}
@@ -187,6 +272,7 @@ func main() {
 func doInstall(cmdline []string) {
 	var (
 		dlgo       = flag.Bool("dlgo", false, "Download Go and build with it")
+		targetOS   = flag.String("os", runtime.GOOS, "Target OS to cross build for")
 		arch       = flag.String("arch", "", "Architecture to cross build for")
 		cc         = flag.String("cc", "", "C compiler to cross build with")
 		staticlink = flag.Bool("static", false, "Create statically-linked executable")
@@ -195,9 +281,9 @@ func doInstall(cmdline []string) {
 	env := build.Env()
 
 	// Configure the toolchain.
-	tc := build.GoToolchain{GOARCH: *arch, CC: *cc}
+	tc := build.GoToolchain{GOOS: *targetOS, GOARCH: *arch, CC: *cc}
 	if *dlgo {
-		csdb := build.MustLoadChecksums("build/checksums.txt")
+		csdb := download.MustLoadChecksums("build/checksums.txt")
 		tc.Root = build.DownloadGo(csdb)
 	}
 	// Disable CLI markdown doc generation in release builds.
@@ -209,16 +295,7 @@ func doInstall(cmdline []string) {
 	}
 
 	// Configure the build.
-	gobuild := tc.Go("build", buildFlags(env, *staticlink, buildTags)...)
-
-	// arm64 CI builders are memory-constrained and can't handle concurrent builds,
-	// better disable it. This check isn't the best, it should probably
-	// check for something in env instead.
-	if env.CI && runtime.GOARCH == "arm64" {
-		gobuild.Args = append(gobuild.Args, "-p", "1")
-	}
-	// We use -trimpath to avoid leaking local paths into the built executables.
-	gobuild.Args = append(gobuild.Args, "-trimpath")
+	gobuild := tc.Go("build", buildFlags(env, *staticlink, buildTags, *targetOS)...)
 
 	// Show packages during build.
 	gobuild.Args = append(gobuild.Args, "-v")
@@ -227,35 +304,86 @@ func doInstall(cmdline []string) {
 	// Default: collect all 'main' packages in cmd/ and build those.
 	packages := flag.Args()
 	if len(packages) == 0 {
-		packages = build.FindMainPackages("./cmd")
+		packages = build.FindMainPackages(&tc, "./cmd/...")
 	}
 
 	// Do the build!
 	for _, pkg := range packages {
-		args := make([]string, len(gobuild.Args))
-		copy(args, gobuild.Args)
-		args = append(args, "-o", executablePath(path.Base(pkg)))
+		args := slices.Clone(gobuild.Args)
+		args = append(args, "-o", executablePath(path.Base(pkg), *targetOS))
 		args = append(args, pkg)
 		build.MustRun(&exec.Cmd{Path: gobuild.Path, Args: args, Env: gobuild.Env})
 	}
 }
 
-// buildFlags returns the go tool flags for building.
-func buildFlags(env build.Environment, staticLinking bool, buildTags []string) (flags []string) {
+// doInstallKeeper builds keeper binaries for all supported targets.
+func doInstallKeeper(cmdline []string) {
+	var dlgo = flag.Bool("dlgo", false, "Download Go and build with it")
+
+	flag.CommandLine.Parse(cmdline)
+	env := build.Env()
+
+	// Configure the toolchain.
+	tc := build.GoToolchain{}
+	if *dlgo {
+		csdb := download.MustLoadChecksums("build/checksums.txt")
+		tc.Root = build.DownloadGo(csdb)
+	}
+
+	for _, target := range keeperTargets {
+		log.Printf("Building keeper-%s", target.Name)
+
+		// Configure the build.
+		tc.GOARCH = target.GOARCH
+		tc.GOOS = target.GOOS
+		tc.CC = target.CC
+		// An empty GOOS means "build for the host OS"; thread that through to
+		// buildFlags so platform-specific linker flags are picked correctly.
+		targetOS := target.GOOS
+		if targetOS == "" {
+			targetOS = runtime.GOOS
+		}
+		gobuild := tc.Go("build", buildFlags(env, true, []string{target.Tags}, targetOS)...)
+		gobuild.Dir = "./cmd/keeper"
+		gobuild.Args = append(gobuild.Args, "-v")
+
+		for key, value := range target.Env {
+			gobuild.Env = append(gobuild.Env, key+"="+value)
+		}
+		outputName := fmt.Sprintf("keeper-%s", target.Name)
+
+		args := slices.Clone(gobuild.Args)
+		args = append(args, "-o", executablePath(outputName, targetOS))
+		args = append(args, ".")
+		build.MustRun(&exec.Cmd{Path: gobuild.Path, Args: args, Env: gobuild.Env, Dir: gobuild.Dir})
+	}
+}
+
+// buildFlags returns the go tool flags for building. targetOS is the OS we
+// are producing binaries for.
+func buildFlags(env build.Environment, staticLinking bool, buildTags []string, targetOS string) (flags []string) {
 	var ld []string
+	// See https://github.com/golang/go/issues/33772#issuecomment-528176001
+	// We need to set --buildid to the linker here, and also pass --build-id to the
+	// cgo-linker further down.
+	ld = append(ld, "--buildid=none")
 	if env.Commit != "" {
 		ld = append(ld, "-X", "github.com/ethereum/go-ethereum/internal/version.gitCommit="+env.Commit)
 		ld = append(ld, "-X", "github.com/ethereum/go-ethereum/internal/version.gitDate="+env.Date)
 	}
 	// Strip DWARF on darwin. This used to be required for certain things,
 	// and there is no downside to this, so we just keep doing it.
-	if runtime.GOOS == "darwin" {
+	if targetOS == "darwin" {
 		ld = append(ld, "-s")
 	}
-	if runtime.GOOS == "linux" {
+	if targetOS == "linux" {
 		// Enforce the stacksize to 8M, which is the case on most platforms apart from
 		// alpine Linux.
-		extld := []string{"-Wl,-z,stack-size=0x800000"}
+		// See https://sourceware.org/binutils/docs-2.23.1/ld/Options.html#Options
+		// regarding the options --build-id=none and --strip-all. It is needed for
+		// reproducible builds; removing references to temporary files in C-land, and
+		// making build-id reproducibly absent.
+		extld := []string{"-Wl,-z,stack-size=0x800000,--build-id=none,--strip-all"}
 		if staticLinking {
 			extld = append(extld, "-static")
 			// Under static linking, use of certain glibc features must be
@@ -264,12 +392,18 @@ func buildFlags(env build.Environment, staticLinking bool, buildTags []string) (
 		}
 		ld = append(ld, "-extldflags", "'"+strings.Join(extld, " ")+"'")
 	}
+	// TODO(gballet): revisit after the input api has been defined
+	if runtime.GOARCH == "wasm" {
+		ld = append(ld, "-gcflags=all=-d=softfloat")
+	}
 	if len(ld) > 0 {
 		flags = append(flags, "-ldflags", strings.Join(ld, " "))
 	}
 	if len(buildTags) > 0 {
 		flags = append(flags, "-tags", strings.Join(buildTags, ","))
 	}
+	// We use -trimpath to avoid leaking local paths into the built executables.
+	flags = append(flags, "-trimpath")
 	return flags
 }
 
@@ -285,24 +419,30 @@ func doTest(cmdline []string) {
 		coverage = flag.Bool("coverage", false, "Whether to record code coverage")
 		verbose  = flag.Bool("v", false, "Whether to log verbosely")
 		race     = flag.Bool("race", false, "Execute the race detector")
-		short     = flag.Bool("short", false, "Pass the 'short'-flag to go test")
+		short    = flag.Bool("short", false, "Pass the 'short'-flag to go test")
 		cachedir = flag.String("cachedir", "./build/cache", "directory for caching downloads")
+		threads  = flag.Int("p", 1, "Number of CPU threads to use for testing")
 	)
 	flag.CommandLine.Parse(cmdline)
 
+	// Load checksums file (needed for both spec tests and dlgo)
+	csdb := download.MustLoadChecksums("build/checksums.txt")
+
 	// Get test fixtures.
-	csdb := build.MustLoadChecksums("build/checksums.txt")
-	downloadSpecTestFixtures(csdb, *cachedir)
+	if !*short {
+		downloadSpecTestFixtures(csdb, *cachedir)
+	}
 
 	// Configure the toolchain.
 	tc := build.GoToolchain{GOARCH: *arch, CC: *cc}
 	if *dlgo {
 		tc.Root = build.DownloadGo(csdb)
 	}
+
 	gotest := tc.Go("test")
 
-	// CI needs a bit more time for the statetests (default 10m).
-	gotest.Args = append(gotest.Args, "-timeout=20m")
+	// CI needs a bit more time for the statetests (default 45m).
+	gotest.Args = append(gotest.Args, "-timeout=45m")
 
 	// Enable CKZG backend in CI.
 	gotest.Args = append(gotest.Args, "-tags=ckzg")
@@ -312,7 +452,7 @@ func doTest(cmdline []string) {
 
 	// Test a single package at a time. CI builders are slow
 	// and some tests run into timeouts under load.
-	gotest.Args = append(gotest.Args, "-p", "1")
+	gotest.Args = append(gotest.Args, "-p", fmt.Sprintf("%d", *threads))
 	if *coverage {
 		gotest.Args = append(gotest.Args, "-covermode=atomic", "-cover")
 	}
@@ -326,25 +466,28 @@ func doTest(cmdline []string) {
 		gotest.Args = append(gotest.Args, "-short")
 	}
 
-	packages := []string{"./..."}
-	if len(flag.CommandLine.Args()) > 0 {
-		packages = flag.CommandLine.Args()
+	packages := flag.CommandLine.Args()
+	if len(packages) > 0 {
+		gotest.Args = append(gotest.Args, packages...)
+		build.MustRun(gotest)
+		return
 	}
-	gotest.Args = append(gotest.Args, packages...)
-	build.MustRun(gotest)
+
+	// No packages specified, run all tests for all modules.
+	gotest.Args = append(gotest.Args, "./...")
+	for _, mod := range goModules {
+		test := *gotest
+		test.Dir = mod
+		build.MustRun(&test)
+	}
 }
 
 // downloadSpecTestFixtures downloads and extracts the execution-spec-tests fixtures.
-func downloadSpecTestFixtures(csdb *build.ChecksumDB, cachedir string) string {
-	executionSpecTestsVersion, err := build.Version(csdb, "spec-tests")
-	if err != nil {
-		log.Fatal(err)
-	}
+func downloadSpecTestFixtures(csdb *download.ChecksumDB, cachedir string) string {
 	ext := ".tar.gz"
-	base := "fixtures_develop" // TODO(MariusVanDerWijden) rename once the version becomes part of the filename
-	url := fmt.Sprintf("https://github.com/ethereum/execution-spec-tests/releases/download/v%s/%s%s", executionSpecTestsVersion, base, ext)
+	base := "fixtures"
 	archivePath := filepath.Join(cachedir, base+ext)
-	if err := csdb.DownloadFile(url, archivePath); err != nil {
+	if err := csdb.DownloadFileFromKnownURL(archivePath); err != nil {
 		log.Fatal(err)
 	}
 	if err := build.ExtractArchive(archivePath, executionSpecTestsDir); err != nil {
@@ -353,33 +496,133 @@ func downloadSpecTestFixtures(csdb *build.ChecksumDB, cachedir string) string {
 	return filepath.Join(cachedir, base)
 }
 
+// doCheckGenerate ensures that re-generating generated files does not cause
+// any mutations in the source file tree.
+func doCheckGenerate() {
+	var (
+		cachedir = flag.String("cachedir", "./build/cache", "directory for caching binaries.")
+		tc       = new(build.GoToolchain)
+	)
+
+	// Run any go generate steps we might be missing
+	var (
+		protocPath      = downloadProtoc(*cachedir)
+		protocGenGoPath = downloadProtocGenGo(*cachedir)
+	)
+	pathList := []string{filepath.Join(protocPath, "bin"), protocGenGoPath, os.Getenv("PATH")}
+
+	excludes := []string{"tests/testdata", "build/cache", ".git"}
+	for i := range excludes {
+		excludes[i] = filepath.FromSlash(excludes[i])
+	}
+
+	for _, mod := range goModules {
+		// Compute the origin hashes of all the files
+		hashes, err := build.HashFolder(mod, excludes)
+		if err != nil {
+			log.Fatal("Error computing hashes", "err", err)
+		}
+
+		c := tc.Go("generate", "./...")
+		c.Env = append(c.Env, "PATH="+strings.Join(pathList, string(os.PathListSeparator)))
+		c.Dir = mod
+		build.MustRun(c)
+		// Check if generate file hashes have changed
+		generated, err := build.HashFolder(mod, excludes)
+		if err != nil {
+			log.Fatalf("Error re-computing hashes: %v", err)
+		}
+		updates := build.DiffHashes(hashes, generated)
+		for _, file := range updates {
+			log.Printf("File changed: %s", file)
+		}
+		if len(updates) != 0 {
+			log.Fatal("One or more generated files were updated by running 'go generate ./...'")
+		}
+	}
+	fmt.Println("No stale files detected.")
+
+	// Run go mod tidy check.
+	for _, mod := range goModules {
+		tidy := tc.Go("mod", "tidy", "-diff")
+		tidy.Dir = mod
+		build.MustRun(tidy)
+	}
+	fmt.Println("No untidy module files detected.")
+}
+
+// doCheckBadDeps verifies whether certain unintended dependencies between some
+// packages leak into the codebase due to a refactor. This is not an exhaustive
+// list, rather something we build up over time at sensitive places.
+func doCheckBadDeps() {
+	baddeps := [][2]string{
+		// Rawdb tends to be a dumping ground for db utils, sometimes leaking the db itself
+		{"github.com/ethereum/go-ethereum/core/rawdb", "github.com/ethereum/go-ethereum/ethdb/leveldb"},
+		{"github.com/ethereum/go-ethereum/core/rawdb", "github.com/ethereum/go-ethereum/ethdb/pebbledb"},
+	}
+	tc := new(build.GoToolchain)
+
+	var failed bool
+	for _, rule := range baddeps {
+		out, err := tc.Go("list", "-deps", rule[0]).CombinedOutput()
+		if err != nil {
+			log.Fatalf("Failed to list '%s' dependencies: %v", rule[0], err)
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.TrimSpace(line) == rule[1] {
+				log.Printf("Found bad dependency '%s' -> '%s'", rule[0], rule[1])
+				failed = true
+			}
+		}
+	}
+	if failed {
+		log.Fatalf("Bad dependencies detected.")
+	}
+	fmt.Println("No bad dependencies detected.")
+}
+
 // doLint runs golangci-lint on requested packages.
 func doLint(cmdline []string) {
 	var (
 		cachedir = flag.String("cachedir", "./build/cache", "directory for caching golangci-lint binary.")
 	)
 	flag.CommandLine.Parse(cmdline)
-	packages := []string{"./..."}
-	if len(flag.CommandLine.Args()) > 0 {
-		packages = flag.CommandLine.Args()
-	}
 
 	linter := downloadLinter(*cachedir)
-	lflags := []string{"run", "--config", ".golangci.yml"}
-	build.MustRunCommand(linter, append(lflags, packages...)...)
+	linter, err := filepath.Abs(linter)
+	if err != nil {
+		log.Fatal(err)
+	}
+	config, err := filepath.Abs(".golangci.yml")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	lflags := []string{"run", "--config", config}
+	packages := flag.CommandLine.Args()
+	if len(packages) > 0 {
+		build.MustRunCommandWithOutput(linter, append(lflags, packages...)...)
+	} else {
+		// Run for all modules in workspace.
+		for _, mod := range goModules {
+			args := append(lflags, "./...")
+			lintcmd := exec.Command(linter, args...)
+			lintcmd.Dir = mod
+			build.MustRunWithOutput(lintcmd)
+		}
+	}
 	fmt.Println("You have achieved perfection.")
 }
 
 // downloadLinter downloads and unpacks golangci-lint.
 func downloadLinter(cachedir string) string {
-	csdb := build.MustLoadChecksums("build/checksums.txt")
-	version, err := build.Version(csdb, "golangci")
+	csdb := download.MustLoadChecksums("build/checksums.txt")
+	version, err := csdb.FindVersion("golangci")
 	if err != nil {
 		log.Fatal(err)
 	}
 	arch := runtime.GOARCH
 	ext := ".tar.gz"
-
 	if runtime.GOOS == "windows" {
 		ext = ".zip"
 	}
@@ -387,9 +630,8 @@ func downloadLinter(cachedir string) string {
 		arch += "v" + os.Getenv("GOARM")
 	}
 	base := fmt.Sprintf("golangci-lint-%s-%s-%s", version, runtime.GOOS, arch)
-	url := fmt.Sprintf("https://github.com/golangci/golangci-lint/releases/download/v%s/%s%s", version, base, ext)
 	archivePath := filepath.Join(cachedir, base+ext)
-	if err := csdb.DownloadFile(url, archivePath); err != nil {
+	if err := csdb.DownloadFileFromKnownURL(archivePath); err != nil {
 		log.Fatal(err)
 	}
 	if err := build.ExtractArchive(archivePath, cachedir); err != nil {
@@ -398,15 +640,102 @@ func downloadLinter(cachedir string) string {
 	return filepath.Join(cachedir, base, "golangci-lint")
 }
 
+// protocArchiveBaseName returns the name of the protoc archive file for
+// the current system, stripped of version and file suffix.
+func protocArchiveBaseName() (string, error) {
+	switch runtime.GOOS + "-" + runtime.GOARCH {
+	case "windows-amd64":
+		return "win64", nil
+	case "windows-386":
+		return "win32", nil
+	case "linux-arm64":
+		return "linux-aarch_64", nil
+	case "linux-386":
+		return "linux-x86_32", nil
+	case "linux-amd64":
+		return "linux-x86_64", nil
+	case "darwin-arm64":
+		return "osx-aarch_64", nil
+	case "darwin-amd64":
+		return "osx-x86_64", nil
+	default:
+		return "", fmt.Errorf("no prebuilt release of protoc available for this system (os: %s, arch: %s)", runtime.GOOS, runtime.GOARCH)
+	}
+}
+
+// downloadProtocGenGo downloads protoc-gen-go, which is used by protoc
+// in the generate command.  It returns the full path of the directory
+// containing the 'protoc-gen-go' executable.
+func downloadProtocGenGo(cachedir string) string {
+	csdb := download.MustLoadChecksums("build/checksums.txt")
+	version, err := csdb.FindVersion("protoc-gen-go")
+	if err != nil {
+		log.Fatal(err)
+	}
+	baseName := fmt.Sprintf("protoc-gen-go.v%s.%s.%s", version, runtime.GOOS, runtime.GOARCH)
+	archiveName := baseName
+	if runtime.GOOS == "windows" {
+		archiveName += ".zip"
+	} else {
+		archiveName += ".tar.gz"
+	}
+
+	archivePath := path.Join(cachedir, archiveName)
+	if err := csdb.DownloadFileFromKnownURL(archivePath); err != nil {
+		log.Fatal(err)
+	}
+	extractDest := filepath.Join(cachedir, baseName)
+	if err := build.ExtractArchive(archivePath, extractDest); err != nil {
+		log.Fatal(err)
+	}
+	extractDest, err = filepath.Abs(extractDest)
+	if err != nil {
+		log.Fatal("error resolving absolute path for protoc", "err", err)
+	}
+	return extractDest
+}
+
+// downloadProtoc downloads the prebuilt protoc binary used to lint generated
+// files as a CI step.  It returns the full path to the directory containing
+// the protoc executable.
+func downloadProtoc(cachedir string) string {
+	csdb := download.MustLoadChecksums("build/checksums.txt")
+	version, err := csdb.FindVersion("protoc")
+	if err != nil {
+		log.Fatal(err)
+	}
+	baseName, err := protocArchiveBaseName()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fileName := fmt.Sprintf("protoc-%s-%s", version, baseName)
+	archiveFileName := fileName + ".zip"
+	archivePath := filepath.Join(cachedir, archiveFileName)
+	if err := csdb.DownloadFileFromKnownURL(archivePath); err != nil {
+		log.Fatal(err)
+	}
+	extractDest := filepath.Join(cachedir, fileName)
+	if err := build.ExtractArchive(archivePath, extractDest); err != nil {
+		log.Fatal(err)
+	}
+	extractDest, err = filepath.Abs(extractDest)
+	if err != nil {
+		log.Fatal("error resolving absolute path for protoc", "err", err)
+	}
+	return extractDest
+}
+
 // Release Packaging
 func doArchive(cmdline []string) {
 	var (
-		arch    = flag.String("arch", runtime.GOARCH, "Architecture cross packaging")
-		atype   = flag.String("type", "zip", "Type of archive to write (zip|tar)")
-		signer  = flag.String("signer", "", `Environment variable holding the signing key (e.g. LINUX_SIGNING_KEY)`)
-		signify = flag.String("signify", "", `Environment variable holding the signify key (e.g. LINUX_SIGNIFY_KEY)`)
-		upload  = flag.String("upload", "", `Destination to upload the archives (usually "gethstore/builds")`)
-		ext     string
+		targetOS = flag.String("os", runtime.GOOS, "Target OS the binaries were built for")
+		arch     = flag.String("arch", runtime.GOARCH, "Architecture cross packaging")
+		atype    = flag.String("type", "zip", "Type of archive to write (zip|tar)")
+		signer   = flag.String("signer", "", `Environment variable holding the signing key (e.g. LINUX_SIGNING_KEY)`)
+		signify  = flag.String("signify", "", `Environment variable holding the signify key (e.g. LINUX_SIGNIFY_KEY)`)
+		upload   = flag.String("upload", "", `Destination to upload the archives (usually "gethstore/builds")`)
+		ext      string
 	)
 	flag.CommandLine.Parse(cmdline)
 	switch *atype {
@@ -420,15 +749,15 @@ func doArchive(cmdline []string) {
 
 	var (
 		env      = build.Env()
-		basegeth = archiveBasename(*arch, params.ArchiveVersion(env.Commit))
+		basegeth = archiveBasename(*targetOS, *arch, version.Archive(env.Commit))
 		geth     = "geth-" + basegeth + ext
 		alltools = "geth-alltools-" + basegeth + ext
 	)
 	maybeSkipArchive(env)
-	if err := build.WriteArchive(geth, gethArchiveFiles); err != nil {
+	if err := build.WriteArchive(geth, gethArchiveFiles(*targetOS)); err != nil {
 		log.Fatal(err)
 	}
-	if err := build.WriteArchive(alltools, allToolsArchiveFiles); err != nil {
+	if err := build.WriteArchive(alltools, allToolsArchiveFiles(*targetOS)); err != nil {
 		log.Fatal(err)
 	}
 	for _, archive := range []string{geth, alltools} {
@@ -438,8 +767,38 @@ func doArchive(cmdline []string) {
 	}
 }
 
-func archiveBasename(arch string, archiveVersion string) string {
-	platform := runtime.GOOS + "-" + arch
+func doKeeperArchive(cmdline []string) {
+	var (
+		signer  = flag.String("signer", "", `Environment variable holding the signing key (e.g. LINUX_SIGNING_KEY)`)
+		signify = flag.String("signify", "", `Environment variable holding the signify key (e.g. LINUX_SIGNIFY_KEY)`)
+		upload  = flag.String("upload", "", `Destination to upload the archives (usually "gethstore/builds")`)
+	)
+	flag.CommandLine.Parse(cmdline)
+
+	var (
+		env    = build.Env()
+		vsn    = version.Archive(env.Commit)
+		keeper = "keeper-" + vsn + ".tar.gz"
+	)
+	maybeSkipArchive(env)
+	files := []string{"COPYING"}
+	for _, target := range keeperTargets {
+		targetOS := target.GOOS
+		if targetOS == "" {
+			targetOS = runtime.GOOS
+		}
+		files = append(files, executablePath(fmt.Sprintf("keeper-%s", target.Name), targetOS))
+	}
+	if err := build.WriteArchive(keeper, files); err != nil {
+		log.Fatal(err)
+	}
+	if err := archiveUpload(keeper, *upload, *signer, *signify); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func archiveBasename(targetOS, arch, archiveVersion string) string {
+	platform := targetOS + "-" + arch
 	if arch == "arm" {
 		platform += os.Getenv("GOARM")
 	}
@@ -505,11 +864,11 @@ func maybeSkipArchive(env build.Environment) {
 }
 
 // Builds the docker images and optionally uploads them to Docker Hub.
-func doDocker(cmdline []string) {
+func doDockerBuildx(cmdline []string) {
 	var (
-		image    = flag.Bool("image", false, `Whether to build and push an arch specific docker image`)
-		manifest = flag.String("manifest", "", `Push a multi-arch docker image for the specified architectures (usually "amd64,arm64")`)
-		upload   = flag.String("upload", "", `Where to upload the docker image (usually "ethereum/client-go")`)
+		platform = flag.String("platform", "", `Push a multi-arch docker image for the specified architectures (usually "linux/amd64,linux/arm64")`)
+		hubImage = flag.String("hub", "ethereum/client-go", `Where to upload the docker image`)
+		upload   = flag.Bool("upload", false, `Whether to trigger upload`)
 	)
 	flag.CommandLine.Parse(cmdline)
 
@@ -541,131 +900,36 @@ func doDocker(cmdline []string) {
 	case env.Branch == "master":
 		tags = []string{"latest"}
 	case strings.HasPrefix(env.Tag, "v1."):
-		tags = []string{"stable", fmt.Sprintf("release-1.%d", params.VersionMinor), "v" + params.Version}
+		tags = []string{"stable", fmt.Sprintf("release-%v", version.Family), "v" + version.Semantic}
 	}
-	// If architecture specific image builds are requested, build and push them
-	if *image {
-		build.MustRunCommand("docker", "build", "--build-arg", "COMMIT="+env.Commit, "--build-arg", "VERSION="+params.VersionWithMeta, "--build-arg", "BUILDNUM="+env.Buildnum, "--tag", fmt.Sprintf("%s:TAG", *upload), ".")
-		build.MustRunCommand("docker", "build", "--build-arg", "COMMIT="+env.Commit, "--build-arg", "VERSION="+params.VersionWithMeta, "--build-arg", "BUILDNUM="+env.Buildnum, "--tag", fmt.Sprintf("%s:alltools-TAG", *upload), "-f", "Dockerfile.alltools", ".")
-
-		// Tag and upload the images to Docker Hub
-		for _, tag := range tags {
-			gethImage := fmt.Sprintf("%s:%s-%s", *upload, tag, runtime.GOARCH)
-			toolImage := fmt.Sprintf("%s:alltools-%s-%s", *upload, tag, runtime.GOARCH)
-
-			// If the image already exists (non version tag), check the build
-			// number to prevent overwriting a newer commit if concurrent builds
-			// are running. This is still a tiny bit racey if two published are
-			// done at the same time, but that's extremely unlikely even on the
-			// master branch.
-			for _, img := range []string{gethImage, toolImage} {
-				if exec.Command("docker", "pull", img).Run() != nil {
-					continue // Generally the only failure is a missing image, which is good
-				}
-				buildnum, err := exec.Command("docker", "inspect", "--format", "{{index .Config.Labels \"buildnum\"}}", img).CombinedOutput()
-				if err != nil {
-					log.Fatalf("Failed to inspect container: %v\nOutput: %s", err, string(buildnum))
-				}
-				buildnum = bytes.TrimSpace(buildnum)
-
-				if len(buildnum) > 0 && len(env.Buildnum) > 0 {
-					oldnum, err := strconv.Atoi(string(buildnum))
-					if err != nil {
-						log.Fatalf("Failed to parse old image build number: %v", err)
-					}
-					newnum, err := strconv.Atoi(env.Buildnum)
-					if err != nil {
-						log.Fatalf("Failed to parse current build number: %v", err)
-					}
-					if oldnum > newnum {
-						log.Fatalf("Current build number %d not newer than existing %d", newnum, oldnum)
-					} else {
-						log.Printf("Updating %s from build %d to %d", img, oldnum, newnum)
-					}
-				}
-			}
-			build.MustRunCommand("docker", "image", "tag", fmt.Sprintf("%s:TAG", *upload), gethImage)
-			build.MustRunCommand("docker", "image", "tag", fmt.Sprintf("%s:alltools-TAG", *upload), toolImage)
-			build.MustRunCommand("docker", "push", gethImage)
-			build.MustRunCommand("docker", "push", toolImage)
-		}
+	// Need to create a mult-arch builder
+	check := exec.Command("docker", "buildx", "inspect", "multi-arch-builder")
+	if check.Run() != nil {
+		build.MustRunCommand("docker", "buildx", "create", "--use", "--name", "multi-arch-builder", "--platform", *platform)
 	}
-	// If multi-arch image manifest push is requested, assemble it
-	if len(*manifest) != 0 {
-		// Since different architectures are pushed by different builders, wait
-		// until all required images are updated.
-		var mismatch bool
-		for i := 0; i < 2; i++ { // 2 attempts, second is race check
-			mismatch = false // hope there's no mismatch now
 
-			for _, tag := range tags {
-				for _, arch := range strings.Split(*manifest, ",") {
-					gethImage := fmt.Sprintf("%s:%s-%s", *upload, tag, arch)
-					toolImage := fmt.Sprintf("%s:alltools-%s-%s", *upload, tag, arch)
-
-					for _, img := range []string{gethImage, toolImage} {
-						if out, err := exec.Command("docker", "pull", img).CombinedOutput(); err != nil {
-							log.Printf("Required image %s unavailable: %v\nOutput: %s", img, err, out)
-							mismatch = true
-							break
-						}
-						buildnum, err := exec.Command("docker", "inspect", "--format", "{{index .Config.Labels \"buildnum\"}}", img).CombinedOutput()
-						if err != nil {
-							log.Fatalf("Failed to inspect container: %v\nOutput: %s", err, string(buildnum))
-						}
-						buildnum = bytes.TrimSpace(buildnum)
-
-						if string(buildnum) != env.Buildnum {
-							log.Printf("Build number mismatch on %s: want %s, have %s", img, env.Buildnum, buildnum)
-							mismatch = true
-							break
-						}
-					}
-					if mismatch {
-						break
-					}
-				}
-				if mismatch {
-					break
-				}
+	for _, spec := range []struct {
+		file string
+		base string
+	}{
+		{file: "Dockerfile", base: fmt.Sprintf("%s:", *hubImage)},
+		{file: "Dockerfile.alltools", base: fmt.Sprintf("%s:alltools-", *hubImage)},
+	} {
+		for _, tag := range tags { // latest, stable etc
+			gethImage := fmt.Sprintf("%s%s", spec.base, tag)
+			cmd := exec.Command("docker", "buildx", "build",
+				"--build-arg", "COMMIT="+env.Commit,
+				"--build-arg", "VERSION="+version.WithMeta,
+				"--build-arg", "BUILDNUM="+env.Buildnum,
+				"--tag", gethImage,
+				"--platform", *platform,
+				"--file", spec.file,
+			)
+			if *upload {
+				cmd.Args = append(cmd.Args, "--push")
 			}
-			if mismatch {
-				// Build numbers mismatching, retry in a short time to
-				// avoid concurrent fails in both publisher images. If
-				// however the retry failed too, it means the concurrent
-				// builder is still crunching, let that do the publish.
-				if i == 0 {
-					time.Sleep(30 * time.Second)
-				}
-				continue
-			}
-			break
-		}
-		if mismatch {
-			log.Println("Relinquishing publish to other builder")
-			return
-		}
-		// Assemble and push the Geth manifest image
-		for _, tag := range tags {
-			gethImage := fmt.Sprintf("%s:%s", *upload, tag)
-
-			var gethSubImages []string
-			for _, arch := range strings.Split(*manifest, ",") {
-				gethSubImages = append(gethSubImages, gethImage+"-"+arch)
-			}
-			build.MustRunCommand("docker", append([]string{"manifest", "create", gethImage}, gethSubImages...)...)
-			build.MustRunCommand("docker", "manifest", "push", gethImage)
-		}
-		// Assemble and push the alltools manifest image
-		for _, tag := range tags {
-			toolImage := fmt.Sprintf("%s:alltools-%s", *upload, tag)
-
-			var toolSubImages []string
-			for _, arch := range strings.Split(*manifest, ",") {
-				toolSubImages = append(toolSubImages, toolImage+"-"+arch)
-			}
-			build.MustRunCommand("docker", append([]string{"manifest", "create", toolImage}, toolSubImages...)...)
-			build.MustRunCommand("docker", "manifest", "push", toolImage)
+			cmd.Args = append(cmd.Args, ".")
+			build.MustRun(cmd)
 		}
 	}
 }
@@ -694,8 +958,8 @@ func doDebianSource(cmdline []string) {
 	}
 	// Download and verify the Go source packages.
 	var (
-		gobootbundle = downloadGoBootstrapSources(*cachedir)
-		gobundle     = downloadGoSources(*cachedir)
+		gobootbundles = downloadGoBootstrapSources(*cachedir)
+		gobundle      = downloadGoSources(*cachedir)
 	)
 	// Download all the dependencies needed to build the sources and run the ci script
 	srcdepfetch := tc.Go("mod", "download")
@@ -706,91 +970,150 @@ func doDebianSource(cmdline []string) {
 	cidepfetch.Env = append(cidepfetch.Env, "GOPATH="+filepath.Join(*workdir, "modgopath"))
 	cidepfetch.Run() // Command fails, don't care, we only need the deps to start it
 
-	// Create Debian packages and upload them.
+	// Create Debian packages and upload them. Each distro is independent, so a
+	// failure in one must not stop the others.
+	var failed []string
 	for _, pkg := range debPackages {
-		for distro, goboot := range debDistroGoBoots {
-			// Prepare the debian package with the go-ethereum sources.
-			meta := newDebMetadata(distro, goboot, *signer, env, now, pkg.Name, pkg.Version, pkg.Executables)
-			pkgdir := stageDebianSource(*workdir, meta)
-
-			// Add bootstrapper Go source code
-			if err := build.ExtractArchive(gobootbundle, pkgdir); err != nil {
-				log.Fatalf("Failed to extract bootstrapper Go sources: %v", err)
+		for _, distro := range debDistros {
+			target := fmt.Sprintf("%s/%s", pkg.Name, distro)
+			err := retry(debianBuildAttempts, func(attempt int) error {
+				if attempt > 1 {
+					log.Printf("Retrying %s (attempt %d/%d)", target, attempt, debianBuildAttempts)
+				}
+				return buildDebianPackage(*workdir, distro, *signer, *upload, *sshUser, env, now, pkg, gobootbundles, gobundle)
+			})
+			if err != nil {
+				log.Printf("FAILED %s: %v", target, err)
+				failed = append(failed, target)
+				continue
 			}
-			if err := os.Rename(filepath.Join(pkgdir, "go"), filepath.Join(pkgdir, ".goboot")); err != nil {
-				log.Fatalf("Failed to rename bootstrapper Go source folder: %v", err)
-			}
-			// Add builder Go source code
-			if err := build.ExtractArchive(gobundle, pkgdir); err != nil {
-				log.Fatalf("Failed to extract builder Go sources: %v", err)
-			}
-			if err := os.Rename(filepath.Join(pkgdir, "go"), filepath.Join(pkgdir, ".go")); err != nil {
-				log.Fatalf("Failed to rename builder Go source folder: %v", err)
-			}
-			// Add all dependency modules in compressed form
-			os.MkdirAll(filepath.Join(pkgdir, ".mod", "cache"), 0755)
-			if err := cp.CopyAll(filepath.Join(pkgdir, ".mod", "cache", "download"), filepath.Join(*workdir, "modgopath", "pkg", "mod", "cache", "download")); err != nil {
-				log.Fatalf("Failed to copy Go module dependencies: %v", err)
-			}
-			// Run the packaging and upload to the PPA
-			debuild := exec.Command("debuild", "-S", "-sa", "-us", "-uc", "-d", "-Zxz", "-nc")
-			debuild.Dir = pkgdir
-			build.MustRun(debuild)
-
-			var (
-				basename  = fmt.Sprintf("%s_%s", meta.Name(), meta.VersionString())
-				source    = filepath.Join(*workdir, basename+".tar.xz")
-				dsc       = filepath.Join(*workdir, basename+".dsc")
-				changes   = filepath.Join(*workdir, basename+"_source.changes")
-				buildinfo = filepath.Join(*workdir, basename+"_source.buildinfo")
-			)
-			if *signer != "" {
-				build.MustRunCommand("debsign", changes)
-			}
-			if *upload != "" {
-				ppaUpload(*workdir, *upload, *sshUser, []string{source, dsc, changes, buildinfo})
-			}
+			log.Printf("Done %s", target)
 		}
+	}
+	if len(failed) > 0 {
+		log.Fatalf("%d of %d debian packages failed: %s", len(failed), len(debPackages)*len(debDistros), strings.Join(failed, ", "))
 	}
 }
 
-// downloadGoBootstrapSources downloads the Go source tarball that will be used
+// debianBuildAttempts is how many times a single distro's package is built before
+// giving up on it.
+const debianBuildAttempts = 3
+
+// retry runs fn until it succeeds or the attempts are exhausted, pausing between
+// tries. The attempt number is passed in so callers can report progress. The
+// error from the last attempt is returned.
+func retry(attempts int, fn func(attempt int) error) error {
+	var err error
+	for i := 1; i <= attempts; i++ {
+		if err = fn(i); err == nil {
+			return nil
+		}
+		if i < attempts {
+			log.Printf("Attempt %d/%d failed: %v", i, attempts, err)
+			time.Sleep(5 * time.Second)
+		}
+	}
+	return fmt.Errorf("all %d attempts failed, last error: %w", attempts, err)
+}
+
+// buildDebianPackage stages, builds, signs and uploads the source package for a
+// single distro.
+func buildDebianPackage(workdir, distro, signer, upload, sshUser string, env build.Environment, now time.Time, pkg distroPackage, gobootbundles []string, gobundle string) error {
+	// Prepare the debian package with the go-ethereum sources.
+	meta := newDebMetadata(distro, signer, env, now, pkg.Name, pkg.Version, pkg.Executables)
+	pkgdir := stageDebianSource(workdir, meta)
+
+	// Add bootstrapper Go source code
+	for i, gobootbundle := range gobootbundles {
+		if err := build.ExtractArchive(gobootbundle, pkgdir); err != nil {
+			return fmt.Errorf("extracting bootstrapper Go sources: %w", err)
+		}
+		if err := os.Rename(filepath.Join(pkgdir, "go"), filepath.Join(pkgdir, fmt.Sprintf(".goboot-%d", i+1))); err != nil {
+			return fmt.Errorf("renaming bootstrapper Go source folder: %w", err)
+		}
+	}
+	// Add builder Go source code
+	if err := build.ExtractArchive(gobundle, pkgdir); err != nil {
+		return fmt.Errorf("extracting builder Go sources: %w", err)
+	}
+	if err := os.Rename(filepath.Join(pkgdir, "go"), filepath.Join(pkgdir, ".go")); err != nil {
+		return fmt.Errorf("renaming builder Go source folder: %w", err)
+	}
+	// Add all dependency modules in compressed form
+	os.MkdirAll(filepath.Join(pkgdir, ".mod", "cache"), 0755)
+	if err := cp.CopyAll(filepath.Join(pkgdir, ".mod", "cache", "download"), filepath.Join(workdir, "modgopath", "pkg", "mod", "cache", "download")); err != nil {
+		return fmt.Errorf("copying Go module dependencies: %w", err)
+	}
+	// Run the packaging and upload to the PPA
+	debuild := exec.Command("debuild", "-S", "-sa", "-us", "-uc", "-d", "-Zxz", "-nc")
+	debuild.Dir = pkgdir
+	if err := build.Run(debuild); err != nil {
+		return fmt.Errorf("debuild: %w", err)
+	}
+	var (
+		basename  = fmt.Sprintf("%s_%s", meta.Name(), meta.VersionString())
+		source    = filepath.Join(workdir, basename+".tar.xz")
+		dsc       = filepath.Join(workdir, basename+".dsc")
+		changes   = filepath.Join(workdir, basename+"_source.changes")
+		buildinfo = filepath.Join(workdir, basename+"_source.buildinfo")
+	)
+	if signer != "" {
+		if err := build.Run(exec.Command("debsign", changes)); err != nil {
+			return fmt.Errorf("debsign: %w", err)
+		}
+	}
+	if upload != "" {
+		if err := ppaUpload(workdir, upload, sshUser, []string{source, dsc, changes, buildinfo}); err != nil {
+			return fmt.Errorf("ppa upload: %w", err)
+		}
+	}
+	return nil
+}
+
+// downloadGoBootstrapSources downloads the Go source tarball(s) that will be used
 // to bootstrap the builder Go.
-func downloadGoBootstrapSources(cachedir string) string {
-	csdb := build.MustLoadChecksums("build/checksums.txt")
-	gobootVersion, err := build.Version(csdb, "ppa-builder")
-	if err != nil {
-		log.Fatal(err)
+func downloadGoBootstrapSources(cachedir string) []string {
+	csdb := download.MustLoadChecksums("build/checksums.txt")
+
+	var bundles []string
+	for _, booter := range []string{"ppa-builder-1.19", "ppa-builder-1.21", "ppa-builder-1.23", "ppa-builder-1.25"} {
+		gobootVersion, err := csdb.FindVersion(booter)
+		if err != nil {
+			log.Fatal(err)
+		}
+		file := fmt.Sprintf("go%s.src.tar.gz", gobootVersion)
+		dst := filepath.Join(cachedir, file)
+		if err := csdb.DownloadFileFromKnownURL(dst); err != nil {
+			log.Fatal(err)
+		}
+		bundles = append(bundles, dst)
 	}
-	file := fmt.Sprintf("go%s.src.tar.gz", gobootVersion)
-	url := "https://dl.google.com/go/" + file
-	dst := filepath.Join(cachedir, file)
-	if err := csdb.DownloadFile(url, dst); err != nil {
-		log.Fatal(err)
-	}
-	return dst
+	return bundles
 }
 
 // downloadGoSources downloads the Go source tarball.
 func downloadGoSources(cachedir string) string {
-	csdb := build.MustLoadChecksums("build/checksums.txt")
-	dlgoVersion, err := build.Version(csdb, "golang")
+	csdb := download.MustLoadChecksums("build/checksums.txt")
+	dlgoVersion, err := csdb.FindVersion("golang")
 	if err != nil {
 		log.Fatal(err)
 	}
 	file := fmt.Sprintf("go%s.src.tar.gz", dlgoVersion)
-	url := "https://dl.google.com/go/" + file
 	dst := filepath.Join(cachedir, file)
-	if err := csdb.DownloadFile(url, dst); err != nil {
+	if err := csdb.DownloadFileFromKnownURL(dst); err != nil {
 		log.Fatal(err)
 	}
 	return dst
 }
 
-func ppaUpload(workdir, ppa, sshUser string, files []string) {
+// ppaUploadAttempts is how many times a single upload is tried. It is separate
+// from debianBuildAttempts so that a flaky upload does not force a rebuild.
+const ppaUploadAttempts = 3
+
+func ppaUpload(workdir, ppa, sshUser string, files []string) error {
 	p := strings.Split(ppa, "/")
 	if len(p) != 2 {
-		log.Fatal("-upload PPA name must contain single /")
+		return fmt.Errorf("-upload PPA name %q must contain a single /", ppa)
 	}
 	if sshUser == "" {
 		sshUser = p[0]
@@ -804,11 +1127,13 @@ func ppaUpload(workdir, ppa, sshUser string, files []string) {
 			os.WriteFile(idfile, sshkey, 0600)
 		}
 	}
-	// Upload
+	// Upload. This doesn't always work, so retry here rather than leaning on the
+	// caller's retry, which would redo the whole (slow) package build just to get
+	// back to this point.
 	dest := sshUser + "@ppa.launchpad.net"
-	if err := build.UploadSFTP(idfile, dest, incomingDir, files); err != nil {
-		log.Fatal(err)
-	}
+	return retry(ppaUploadAttempts, func(int) error {
+		return build.UploadSFTP(idfile, dest, incomingDir, files)
+	})
 }
 
 func getenvBase64(variable string) []byte {
@@ -839,17 +1164,14 @@ func isUnstableBuild(env build.Environment) bool {
 	return true
 }
 
-type debPackage struct {
-	Name        string          // the name of the Debian package to produce, e.g. "ethereum"
-	Version     string          // the clean version of the debPackage, e.g. 1.8.12, without any metadata
-	Executables []debExecutable // executables to be included in the package
+type distroPackage struct {
+	Name        string             // the name of the Debian package to produce, e.g. "ethereum"
+	Version     string             // the clean version of the distroPackage, e.g. 1.8.12, without any metadata
+	Executables []distroExecutable // executables to be included in the package
 }
 
 type debMetadata struct {
-	Env           build.Environment
-	GoBootPackage string
-	GoBootPath    string
-
+	Env         build.Environment
 	PackageName string
 
 	// go-ethereum version being built. Note that this
@@ -859,10 +1181,10 @@ type debMetadata struct {
 
 	Author       string // "name <email>", also selects signing key
 	Distro, Time string
-	Executables  []debExecutable
+	Executables  []distroExecutable
 }
 
-type debExecutable struct {
+type distroExecutable struct {
 	PackageName string
 	BinaryName  string
 	Description string
@@ -870,28 +1192,26 @@ type debExecutable struct {
 
 // Package returns the name of the package if present, or
 // fallbacks to BinaryName
-func (d debExecutable) Package() string {
+func (d distroExecutable) Package() string {
 	if d.PackageName != "" {
 		return d.PackageName
 	}
 	return d.BinaryName
 }
 
-func newDebMetadata(distro, goboot, author string, env build.Environment, t time.Time, name string, version string, exes []debExecutable) debMetadata {
+func newDebMetadata(distro, author string, env build.Environment, t time.Time, name string, version string, exes []distroExecutable) debMetadata {
 	if author == "" {
 		// No signing key, use default author.
 		author = "Ethereum Builds <fjl@ethereum.org>"
 	}
 	return debMetadata{
-		GoBootPackage: goboot,
-		GoBootPath:    debGoBootPaths[goboot],
-		PackageName:   name,
-		Env:           env,
-		Author:        author,
-		Distro:        distro,
-		Version:       version,
-		Time:          t.Format(time.RFC1123Z),
-		Executables:   exes,
+		PackageName: name,
+		Env:         env,
+		Author:      author,
+		Distro:      distro,
+		Version:     version,
+		Time:        t.Format(time.RFC1123Z),
+		Executables: exes,
 	}
 }
 
@@ -926,7 +1246,7 @@ func (meta debMetadata) ExeList() string {
 }
 
 // ExeName returns the package name of an executable package.
-func (meta debMetadata) ExeName(exe debExecutable) string {
+func (meta debMetadata) ExeName(exe distroExecutable) string {
 	if isUnstableBuild(meta.Env) {
 		return exe.Package() + "-unstable"
 	}
@@ -935,7 +1255,7 @@ func (meta debMetadata) ExeName(exe debExecutable) string {
 
 // ExeConflicts returns the content of the Conflicts field
 // for executable packages.
-func (meta debMetadata) ExeConflicts(exe debExecutable) string {
+func (meta debMetadata) ExeConflicts(exe distroExecutable) string {
 	if isUnstableBuild(meta.Env) {
 		// Set up the conflicts list so that the *-unstable packages
 		// cannot be installed alongside the regular version.
@@ -953,6 +1273,12 @@ func (meta debMetadata) ExeConflicts(exe debExecutable) string {
 func stageDebianSource(tmpdir string, meta debMetadata) (pkgdir string) {
 	pkg := meta.Name() + "-" + meta.VersionString()
 	pkgdir = filepath.Join(tmpdir, pkg)
+
+	// Start from a clean directory so that staging can be repeated, which a retry
+	// of the enclosing build depends on.
+	if err := os.RemoveAll(pkgdir); err != nil {
+		log.Fatal(err)
+	}
 	if err := os.Mkdir(pkgdir, 0755); err != nil {
 		log.Fatal(err)
 	}
@@ -976,13 +1302,273 @@ func stageDebianSource(tmpdir string, meta debMetadata) (pkgdir string) {
 	return pkgdir
 }
 
+// RPM Packaging
+//
+// Fedora packages are produced by handing a source RPM to COPR, which is the
+// Fedora counterpart of Launchpad's PPA builders.
+//
+// As for the debian packages, the Go sources are shipped inside the source
+// package and the builder compiles them before building go-ethereum. Fedora
+// tracks Go closely enough that its system Go regularly runs ahead of what our
+// dependency tree supports, so relying on it makes the packaging break every
+// time Fedora rebases (Fedora 45 shipping Go 1.27 is the current example).
+func doRPMSource(cmdline []string) {
+	var (
+		cachedir = flag.String("cachedir", "./build/cache", `Filesystem path to cache the downloaded Go bundles at`)
+		packager = flag.String("packager", "", `Package author, in "name <email>" form`)
+		upload   = flag.String("upload", "", `COPR project to submit the source package to`)
+		chroots  = flag.String("chroots", strings.Join(fedoraChroots, ","), `Comma separated COPR chroots to build for, empty means every chroot enabled in the project`)
+		wait     = flag.Bool("wait", false, `Block until the COPR builds finish instead of only submitting them`)
+		workdir  = flag.String("workdir", "", `Output directory for packages (uses temp dir if unset)`)
+		now      = time.Now()
+	)
+	flag.CommandLine.Parse(cmdline)
+	*workdir = makeWorkdir(*workdir)
+	env := build.Env()
+	tc := new(build.GoToolchain)
+	maybeSkipArchive(env)
+
+	// Place the COPR API credentials where copr-cli looks for them.
+	if *upload != "" {
+		writeCoprConfig()
+	}
+	gobundle := downloadGoSources(*cachedir)
+
+	modgopath := filepath.Join(*workdir, "modgopath")
+
+	srcdepfetch := tc.Go("mod", "download")
+	srcdepfetch.Env = append(srcdepfetch.Env, "GOPATH="+modgopath)
+	build.MustRun(srcdepfetch)
+
+	cidepfetch := tc.Go("run", "./build/ci.go")
+	cidepfetch.Env = append(cidepfetch.Env, "GOPATH="+modgopath)
+	cidepfetch.Run() // Command fails, don't care, we only need the deps to start it
+
+	var failed []string
+	for _, pkg := range rpmPackages {
+		err := retry(rpmBuildAttempts, func(attempt int) error {
+			if attempt > 1 {
+				log.Printf("Retrying %s (attempt %d/%d)", pkg.Name, attempt, rpmBuildAttempts)
+			}
+			return buildRPMPackage(*workdir, modgopath, *packager, *upload, *chroots, *wait, env, now, pkg, gobundle)
+		})
+		if err != nil {
+			log.Printf("FAILED %s: %v", pkg.Name, err)
+			failed = append(failed, pkg.Name)
+			continue
+		}
+		log.Printf("Done %s", pkg.Name)
+	}
+	if len(failed) > 0 {
+		log.Fatalf("%d of %d rpm packages failed: %s", len(failed), len(rpmPackages), strings.Join(failed, ", "))
+	}
+}
+
+const rpmBuildAttempts = 3
+
+// buildRPMPackage stages the sources, packs them, turns the result into a source
+// RPM and optionally submits it to COPR.
+func buildRPMPackage(workdir, modgopath, packager, upload, chroots string, wait bool, env build.Environment, now time.Time, pkg distroPackage, gobundle string) error {
+	meta := newRPMMetadata(packager, env, now, pkg)
+
+	var (
+		topdir  = filepath.Join(workdir, "rpmbuild")
+		specdir = filepath.Join(topdir, "SPECS")
+		srcdir  = filepath.Join(topdir, "SOURCES")
+		srpmdir = filepath.Join(topdir, "SRPMS")
+	)
+	if err := os.RemoveAll(topdir); err != nil {
+		return err
+	}
+	for _, dir := range []string{specdir, srcdir, srpmdir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+	pkgdir, err := stageRPMSource(workdir, modgopath, gobundle, meta)
+	if err != nil {
+		return err
+	}
+	tar := exec.Command("tar", "--use-compress-program", "xz -T0", "-cf", filepath.Join(srcdir, meta.SourceName()), filepath.Base(pkgdir))
+	tar.Dir = workdir
+	if err := build.Run(tar); err != nil {
+		return fmt.Errorf("tar: %w", err)
+	}
+	spec := filepath.Join(specdir, meta.Name()+".spec")
+	build.Render("build/rpm/"+meta.PackageName+"/rpm.spec", spec, 0644, meta)
+
+	rpmbuild := exec.Command("rpmbuild", "-bs", "--define", "_topdir "+topdir, "--define", "dist %{nil}", spec)
+	if err := build.Run(rpmbuild); err != nil {
+		return fmt.Errorf("rpmbuild: %w", err)
+	}
+	srpms, err := filepath.Glob(filepath.Join(srpmdir, "*.src.rpm"))
+	if err != nil {
+		return err
+	}
+	if len(srpms) != 1 {
+		return fmt.Errorf("expected exactly one source RPM in %s, got %d", srpmdir, len(srpms))
+	}
+	if upload != "" {
+		return coprUpload(upload, chroots, wait, srpms[0])
+	}
+	return nil
+}
+
+// stageRPMSource checks the repository out into a versioned directory and adds
+// the bundled Go sources and module cache to it.
+func stageRPMSource(workdir, modgopath, gobundle string, meta rpmMetadata) (pkgdir string, err error) {
+	pkgdir = filepath.Join(workdir, meta.Name()+"-"+meta.Version)
+
+	if err := os.RemoveAll(pkgdir); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(pkgdir, 0755); err != nil {
+		return "", err
+	}
+	build.MustRunCommand("git", "checkout-index", "-a", "--prefix", pkgdir+string(filepath.Separator))
+
+	if err := build.ExtractArchive(gobundle, pkgdir); err != nil {
+		return "", fmt.Errorf("extracting builder Go sources: %w", err)
+	}
+	if err := os.Rename(filepath.Join(pkgdir, "go"), filepath.Join(pkgdir, ".go")); err != nil {
+		return "", fmt.Errorf("renaming builder Go source folder: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(pkgdir, ".mod", "cache"), 0755); err != nil {
+		return "", err
+	}
+	if err := cp.CopyAll(filepath.Join(pkgdir, ".mod", "cache", "download"), filepath.Join(modgopath, "pkg", "mod", "cache", "download")); err != nil {
+		return "", fmt.Errorf("copying Go module dependencies: %w", err)
+	}
+	return pkgdir, nil
+}
+
+// writeCoprConfig materializes the COPR API credentials from the environment.
+// COPR_API_TOKEN holds the base64 encoded copy of the config file that the COPR
+// web UI hands out at https://copr.fedorainfracloud.org/api/.
+func writeCoprConfig() {
+	token := getenvBase64("COPR_API_TOKEN")
+	if len(token) == 0 {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatal(err)
+	}
+	dir := filepath.Join(home, ".config")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		log.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "copr"), token, 0600); err != nil {
+		log.Fatal(err)
+	}
+}
+
+const coprUploadAttempts = 3
+
+func coprUpload(project, chroots string, wait bool, srpm string) error {
+	args := []string{"build"}
+	for _, chroot := range strings.Split(chroots, ",") {
+		if chroot = strings.TrimSpace(chroot); chroot != "" {
+			args = append(args, "--chroot", chroot)
+		}
+	}
+	if !wait {
+		args = append(args, "--nowait")
+	}
+	args = append(args, project, srpm)
+
+	return retry(coprUploadAttempts, func(int) error {
+		if err := build.Run(exec.Command("copr-cli", args...)); err != nil {
+			return fmt.Errorf("copr-cli build: %w", err)
+		}
+		return nil
+	})
+}
+
+type rpmMetadata struct {
+	Env         build.Environment
+	PackageName string
+
+	// go-ethereum version being built. Note that this is not the full RPM package
+	// version, the release part is constructed by Release.
+	Version string
+
+	Author      string // "name <email>", ends up in the changelog
+	Time        string // changelog date, in RPM's own format
+	Executables []distroExecutable
+}
+
+func newRPMMetadata(author string, env build.Environment, t time.Time, pkg distroPackage) rpmMetadata {
+	if author == "" {
+		author = "Ethereum Builds <fjl@ethereum.org>"
+	}
+	return rpmMetadata{
+		Env:         env,
+		PackageName: pkg.Name,
+		Version:     pkg.Version,
+		Author:      author,
+		Time:        t.UTC().Format("Mon Jan 02 2006"),
+		Executables: pkg.Executables,
+	}
+}
+
+// Name returns the name of the metapackage that depends on all executable
+// packages.
+func (meta rpmMetadata) Name() string {
+	if isUnstableBuild(meta.Env) {
+		return meta.PackageName + "-unstable"
+	}
+	return meta.PackageName
+}
+
+// Release returns the RPM release field, dist tag included. Unstable builds use
+// the Fedora pre-release scheme (0.<n>.<snapshot>) so that they always sort
+// below the eventual stable release carrying the same version.
+func (meta rpmMetadata) Release() string {
+	if !isUnstableBuild(meta.Env) {
+		return "1%{?dist}"
+	}
+	release := "0"
+	if meta.Env.Buildnum != "" {
+		release += "." + meta.Env.Buildnum
+	}
+	if len(meta.Env.Commit) >= 8 {
+		release += ".git" + meta.Env.Commit[:8]
+	}
+	return release + "%{?dist}"
+}
+
+// SourceName returns the file name of the tarball referenced by Source0.
+func (meta rpmMetadata) SourceName() string {
+	return meta.Name() + "-" + meta.Version + ".tar.xz"
+}
+
+// ExeName returns the package name of an executable package.
+func (meta rpmMetadata) ExeName(exe distroExecutable) string {
+	if isUnstableBuild(meta.Env) {
+		return exe.Package() + "-unstable"
+	}
+	return exe.Package()
+}
+
+// ExeConflicts returns the content of the Conflicts field for executable
+// packages. It mirrors the debian packages: the *-unstable packages cannot be
+// installed alongside the regular version.
+func (meta rpmMetadata) ExeConflicts(exe distroExecutable) string {
+	if isUnstableBuild(meta.Env) {
+		return "ethereum, " + exe.Package()
+	}
+	return ""
+}
+
 // Windows installer
 func doWindowsInstaller(cmdline []string) {
 	// Parse the flags and make skip installer generation on PRs
 	var (
 		arch    = flag.String("arch", runtime.GOARCH, "Architecture for cross build packaging")
 		signer  = flag.String("signer", "", `Environment variable holding the signing key (e.g. WINDOWS_SIGNING_KEY)`)
-		signify = flag.String("signify key", "", `Environment variable holding the signify signing key (e.g. WINDOWS_SIGNIFY_KEY)`)
+		signify = flag.String("signify", "", `Environment variable holding the signify signing key (e.g. WINDOWS_SIGNIFY_KEY)`)
 		upload  = flag.String("upload", "", `Destination to upload the archives (usually "gethstore/builds")`)
 		workdir = flag.String("workdir", "", `Output directory for packages (uses temp dir if unset)`)
 	)
@@ -991,13 +1577,13 @@ func doWindowsInstaller(cmdline []string) {
 	env := build.Env()
 	maybeSkipArchive(env)
 
-	// Aggregate binaries that are included in the installer
+	// Aggregate binaries that are included in the installer.
 	var (
 		devTools []string
 		allTools []string
 		gethTool string
 	)
-	for _, file := range allToolsArchiveFiles {
+	for _, file := range allToolsArchiveFiles("windows") {
 		if file == "COPYING" { // license, copied later
 			continue
 		}
@@ -1030,20 +1616,28 @@ func doWindowsInstaller(cmdline []string) {
 	// Build the installer. This assumes that all the needed files have been previously
 	// built (don't mix building and packaging to keep cross compilation complexity to a
 	// minimum).
-	version := strings.Split(params.Version, ".")
+	ver := strings.Split(version.Semantic, ".")
 	if env.Commit != "" {
-		version[2] += "-" + env.Commit[:8]
+		ver[2] += "-" + env.Commit[:8]
 	}
-	installer, err := filepath.Abs("geth-" + archiveBasename(*arch, params.ArchiveVersion(env.Commit)) + ".exe")
+	installer, err := filepath.Abs("geth-" + archiveBasename("windows", *arch, version.Archive(env.Commit)) + ".exe")
 	if err != nil {
 		log.Fatalf("Failed to convert installer file path: %v", err)
 	}
-	build.MustRunCommand("makensis.exe",
-		"/DOUTPUTFILE="+installer,
-		"/DMAJORVERSION="+version[0],
-		"/DMINORVERSION="+version[1],
-		"/DBUILDVERSION="+version[2],
-		"/DARCH="+*arch,
+	// makensis on Windows is "makensis.exe" with /D-style defines; on Linux
+	// (and other Unixes) the binary is "makensis" and accepts -D.
+	makensisCmd := "makensis"
+	defineFlag := "-D"
+	if runtime.GOOS == "windows" {
+		makensisCmd = "makensis.exe"
+		defineFlag = "/D"
+	}
+	build.MustRunCommand(makensisCmd,
+		defineFlag+"OUTPUTFILE="+installer,
+		defineFlag+"MAJORVERSION="+ver[0],
+		defineFlag+"MINORVERSION="+ver[1],
+		defineFlag+"BUILDVERSION="+ver[2],
+		defineFlag+"ARCH="+*arch,
 		filepath.Join(*workdir, "geth.nsi"),
 	)
 	// Sign and publish installer.
@@ -1106,5 +1700,6 @@ func doPurge(cmdline []string) {
 }
 
 func doSanityCheck() {
-	build.DownloadAndVerifyChecksums(build.MustLoadChecksums("build/checksums.txt"))
+	csdb := download.MustLoadChecksums("build/checksums.txt")
+	csdb.DownloadAndVerifyAll()
 }

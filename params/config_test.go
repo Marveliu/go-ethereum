@@ -17,12 +17,13 @@
 package params
 
 import (
+	"math"
 	"math/big"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCheckCompatible(t *testing.T) {
@@ -135,5 +136,63 @@ func TestConfigRules(t *testing.T) {
 	stamp = math.MaxInt64
 	if r := c.Rules(big.NewInt(0), true, stamp); !r.IsShanghai {
 		t.Errorf("expected %v to be shanghai", stamp)
+	}
+}
+
+func TestTimestampCompatError(t *testing.T) {
+	require.Equal(t, new(ConfigCompatError).Error(), "")
+
+	errWhat := "Shanghai fork timestamp"
+	require.Equal(t, newTimestampCompatError(errWhat, nil, newUint64(1681338455)).Error(),
+		"mismatching Shanghai fork timestamp in database (have timestamp nil, want timestamp 1681338455, rewindto timestamp 1681338454)")
+
+	require.Equal(t, newTimestampCompatError(errWhat, newUint64(1681338455), nil).Error(),
+		"mismatching Shanghai fork timestamp in database (have timestamp 1681338455, want timestamp nil, rewindto timestamp 1681338454)")
+
+	require.Equal(t, newTimestampCompatError(errWhat, newUint64(1681338455), newUint64(600624000)).Error(),
+		"mismatching Shanghai fork timestamp in database (have timestamp 1681338455, want timestamp 600624000, rewindto timestamp 600623999)")
+
+	require.Equal(t, newTimestampCompatError(errWhat, newUint64(0), newUint64(1681338455)).Error(),
+		"mismatching Shanghai fork timestamp in database (have timestamp 0, want timestamp 1681338455, rewindto timestamp 0)")
+}
+
+func TestCheckConfigForkOrderBPO(t *testing.T) {
+	tests := []struct {
+		name                     string
+		osaka, amsterdam, bogota *uint64
+		bpo1, bpo2, bpo3, bpo4   *uint64
+		wantErr                  bool
+	}{
+		{name: "bpo3 before amsterdam", osaka: newUint64(0), bpo1: newUint64(0), bpo2: newUint64(0), bpo3: newUint64(10), amsterdam: newUint64(20), wantErr: true},
+		{name: "bpo2 before amsterdam", osaka: newUint64(0), bpo1: newUint64(0), bpo2: newUint64(10), amsterdam: newUint64(20)},
+		{name: "bpo after amsterdam", osaka: newUint64(0), bpo1: newUint64(0), bpo2: newUint64(0), amsterdam: newUint64(0), bpo3: newUint64(15000)},
+		{name: "bpo transition after amsterdam", osaka: newUint64(0), amsterdam: newUint64(0), bpo3: newUint64(0), bpo4: newUint64(15000)},
+		{name: "bpo with bogota", osaka: newUint64(0), bpo1: newUint64(0), bpo2: newUint64(0), amsterdam: newUint64(0), bogota: newUint64(100), bpo3: newUint64(100)},
+		{name: "bpo before osaka", osaka: newUint64(10), bpo1: newUint64(5), wantErr: true},
+		{name: "bpo out of order", osaka: newUint64(0), bpo3: newUint64(20), bpo4: newUint64(10), wantErr: true},
+		{name: "amsterdam before osaka", osaka: newUint64(10), amsterdam: newUint64(5), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := *MergedTestChainConfig
+			config.OsakaTime = tt.osaka
+			config.AmsterdamTime = tt.amsterdam
+			config.BogotaTime = tt.bogota
+			config.BPO1Time, config.BPO2Time, config.BPO3Time, config.BPO4Time = tt.bpo1, tt.bpo2, tt.bpo3, tt.bpo4
+			config.BlobScheduleConfig = &BlobScheduleConfig{
+				Cancun: DefaultCancunBlobConfig,
+				Prague: DefaultPragueBlobConfig,
+				BPO1:   DefaultBPO1BlobConfig,
+				BPO2:   DefaultBPO2BlobConfig,
+				BPO3:   DefaultBPO3BlobConfig,
+				BPO4:   DefaultBPO4BlobConfig,
+			}
+			err := config.CheckConfigForkOrder()
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
 	}
 }

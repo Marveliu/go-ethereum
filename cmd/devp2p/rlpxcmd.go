@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -24,10 +25,36 @@ import (
 	"github.com/ethereum/go-ethereum/cmd/devp2p/internal/ethtest"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/rlpx"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/urfave/cli/v2"
 )
+
+// decodeRLPxDisconnect parses a disconnect message payload. Per the RLPx spec
+// the payload is a list containing a single reason, but some implementations
+// (including older geth) sent the reason as a bare byte. Accept both forms.
+func decodeRLPxDisconnect(data []byte) (p2p.DiscReason, error) {
+	s := rlp.NewStream(bytes.NewReader(data), uint64(len(data)))
+	k, _, err := s.Kind()
+	if err != nil {
+		return 0, err
+	}
+	var reason p2p.DiscReason
+	if k == rlp.List {
+		if _, err := s.List(); err != nil {
+			return 0, err
+		}
+		if err := s.Decode(&reason); err != nil {
+			return 0, err
+		}
+		return reason, nil
+	}
+	if err := s.Decode(&reason); err != nil {
+		return 0, err
+	}
+	return reason, nil
+}
 
 var (
 	rlpxCommand = &cli.Command{
@@ -37,6 +64,7 @@ var (
 			rlpxPingCommand,
 			rlpxEthTestCommand,
 			rlpxSnapTestCommand,
+			rlpxSnap2TestCommand,
 		},
 	}
 	rlpxPingCommand = &cli.Command{
@@ -46,29 +74,55 @@ var (
 	}
 	rlpxEthTestCommand = &cli.Command{
 		Name:      "eth-test",
-		Usage:     "Runs tests against a node",
-		ArgsUsage: "<node> <chain.rlp> <genesis.json>",
+		Usage:     "Runs eth protocol tests against a node",
+		ArgsUsage: "<node>",
 		Action:    rlpxEthTest,
 		Flags: []cli.Flag{
 			testPatternFlag,
 			testTAPFlag,
+			testChainDirFlag,
+			testNodeFlag,
+			testNodeJWTFlag,
+			testNodeEngineFlag,
 		},
 	}
 	rlpxSnapTestCommand = &cli.Command{
 		Name:      "snap-test",
-		Usage:     "Runs tests against a node",
-		ArgsUsage: "<node> <chain.rlp> <genesis.json>",
+		Usage:     "Runs snap protocol tests against a node",
+		ArgsUsage: "",
 		Action:    rlpxSnapTest,
 		Flags: []cli.Flag{
 			testPatternFlag,
 			testTAPFlag,
+			testChainDirFlag,
+			testNodeFlag,
+			testNodeJWTFlag,
+			testNodeEngineFlag,
+		},
+	}
+	rlpxSnap2TestCommand = &cli.Command{
+		Name:      "snap2-test",
+		Usage:     "Runs snap/2 (EIP-8189) protocol tests against a node",
+		ArgsUsage: "",
+		Action:    rlpxSnap2Test,
+		Flags: []cli.Flag{
+			testPatternFlag,
+			testTAPFlag,
+			testChainDirFlag,
+			testNodeFlag,
+			testNodeJWTFlag,
+			testNodeEngineFlag,
 		},
 	}
 )
 
 func rlpxPing(ctx *cli.Context) error {
 	n := getNodeArg(ctx)
-	fd, err := net.Dial("tcp", fmt.Sprintf("%v:%d", n.IP(), n.TCP()))
+	tcpEndpoint, ok := n.TCPEndpoint()
+	if !ok {
+		return errors.New("node has no TCP endpoint")
+	}
+	fd, err := net.Dial("tcp", tcpEndpoint.String())
 	if err != nil {
 		return err
 	}
@@ -90,23 +144,25 @@ func rlpxPing(ctx *cli.Context) error {
 		}
 		fmt.Printf("%+v\n", h)
 	case 1:
-		var msg []p2p.DiscReason
-		if rlp.DecodeBytes(data, &msg); len(msg) == 0 {
-			return errors.New("invalid disconnect message")
+		// The disconnect message is specified as a list containing the reason,
+		// but some implementations (including older geth) send the reason as a
+		// single byte. Handle both forms, and on failure include the raw payload
+		// so the operator can see what was actually sent.
+		reason, decErr := decodeRLPxDisconnect(data)
+		if decErr != nil {
+			return fmt.Errorf("invalid disconnect message: %v (raw=0x%x)", decErr, data)
 		}
-		return fmt.Errorf("received disconnect message: %v", msg[0])
+		return fmt.Errorf("received disconnect message: %v", reason)
 	default:
-		return fmt.Errorf("invalid message code %d, expected handshake (code zero)", code)
+		return fmt.Errorf("invalid message code %d, expected handshake (code zero) or disconnect (code one)", code)
 	}
 	return nil
 }
 
 // rlpxEthTest runs the eth protocol test suite.
 func rlpxEthTest(ctx *cli.Context) error {
-	if ctx.NArg() < 3 {
-		exit("missing path to chain.rlp as command-line argument")
-	}
-	suite, err := ethtest.NewSuite(getNodeArg(ctx), ctx.Args().Get(1), ctx.Args().Get(2))
+	p := cliTestParams(ctx)
+	suite, err := ethtest.NewSuite(p.node, p.chainDir, p.engineAPI, p.jwt)
 	if err != nil {
 		exit(err)
 	}
@@ -115,12 +171,42 @@ func rlpxEthTest(ctx *cli.Context) error {
 
 // rlpxSnapTest runs the snap protocol test suite.
 func rlpxSnapTest(ctx *cli.Context) error {
-	if ctx.NArg() < 3 {
-		exit("missing path to chain.rlp as command-line argument")
-	}
-	suite, err := ethtest.NewSuite(getNodeArg(ctx), ctx.Args().Get(1), ctx.Args().Get(2))
+	p := cliTestParams(ctx)
+	suite, err := ethtest.NewSuite(p.node, p.chainDir, p.engineAPI, p.jwt)
 	if err != nil {
 		exit(err)
 	}
 	return runTests(ctx, suite.SnapTests())
+}
+
+// rlpxSnap2Test runs the snap/2 (EIP-8189) protocol test suite.
+func rlpxSnap2Test(ctx *cli.Context) error {
+	p := cliTestParams(ctx)
+	suite, err := ethtest.NewSuite(p.node, p.chainDir, p.engineAPI, p.jwt)
+	if err != nil {
+		exit(err)
+	}
+	return runTests(ctx, suite.Snap2Tests())
+}
+
+type testParams struct {
+	node      *enode.Node
+	engineAPI string
+	jwt       string
+	chainDir  string
+}
+
+func cliTestParams(ctx *cli.Context) *testParams {
+	nodeStr := ctx.String(testNodeFlag.Name)
+	node, err := parseNode(nodeStr)
+	if err != nil {
+		exit(err)
+	}
+	p := testParams{
+		node:      node,
+		engineAPI: ctx.String(testNodeEngineFlag.Name),
+		jwt:       ctx.String(testNodeJWTFlag.Name),
+		chainDir:  ctx.String(testChainDirFlag.Name),
+	}
+	return &p
 }

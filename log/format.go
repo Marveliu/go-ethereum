@@ -3,6 +3,7 @@ package log
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"reflect"
 	"strconv"
@@ -10,7 +11,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/holiman/uint256"
-	"golang.org/x/exp/slog"
 )
 
 const (
@@ -23,22 +23,6 @@ const (
 // 40 spaces
 var spaces = []byte("                                        ")
 
-type Format interface {
-	Format(r slog.Record) []byte
-}
-
-// FormatFunc returns a new Format object which uses
-// the given function to perform record formatting.
-func FormatFunc(f func(slog.Record) []byte) Format {
-	return formatFunc(f)
-}
-
-type formatFunc func(slog.Record) []byte
-
-func (f formatFunc) Format(r slog.Record) []byte {
-	return f(r)
-}
-
 // TerminalStringer is an analogous interface to the stdlib stringer, allowing
 // own types to have custom shortened serialization formats when printed to the
 // screen.
@@ -46,7 +30,7 @@ type TerminalStringer interface {
 	TerminalString() string
 }
 
-func (h *TerminalHandler) TerminalFormat(buf []byte, r slog.Record, usecolor bool) []byte {
+func (h *TerminalHandler) format(buf []byte, r slog.Record, usecolor bool) []byte {
 	msg := escapeMessage(r.Message)
 	var color = ""
 	if usecolor {
@@ -88,31 +72,25 @@ func (h *TerminalHandler) TerminalFormat(buf []byte, r slog.Record, usecolor boo
 	if (r.NumAttrs()+len(h.attrs)) > 0 && length < termMsgJust {
 		b.Write(spaces[:termMsgJust-length])
 	}
-	// print the keys logfmt style
-	h.logfmt(b, r, color)
+	// print the attributes
+	h.formatAttributes(b, r, color)
 
 	return b.Bytes()
 }
 
-func (h *TerminalHandler) logfmt(buf *bytes.Buffer, r slog.Record, color string) {
-	// tmp is a temporary buffer we use, until bytes.Buffer.AvailableBuffer() (1.21)
-	// can be used.
-	var tmp = make([]byte, 40)
-	writeAttr := func(attr slog.Attr, first, last bool) {
+func (h *TerminalHandler) formatAttributes(buf *bytes.Buffer, r slog.Record, color string) {
+	writeAttr := func(attr slog.Attr, last bool) {
 		buf.WriteByte(' ')
 
 		if color != "" {
 			buf.WriteString(color)
-			//buf.Write(appendEscapeString(buf.AvailableBuffer(), attr.Key))
-			buf.Write(appendEscapeString(tmp[:0], attr.Key))
+			buf.Write(appendEscapeString(buf.AvailableBuffer(), attr.Key))
 			buf.WriteString("\x1b[0m=")
 		} else {
-			//buf.Write(appendEscapeString(buf.AvailableBuffer(), attr.Key))
-			buf.Write(appendEscapeString(tmp[:0], attr.Key))
+			buf.Write(appendEscapeString(buf.AvailableBuffer(), attr.Key))
 			buf.WriteByte('=')
 		}
-		//val := FormatSlogValue(attr.Value, true, buf.AvailableBuffer())
-		val := FormatSlogValue(attr.Value, true, tmp[:0])
+		val := FormatSlogValue(attr.Value, buf.AvailableBuffer())
 
 		padding := h.fieldPadding[attr.Key]
 
@@ -129,23 +107,23 @@ func (h *TerminalHandler) logfmt(buf *bytes.Buffer, r slog.Record, color string)
 	var n = 0
 	var nAttrs = len(h.attrs) + r.NumAttrs()
 	for _, attr := range h.attrs {
-		writeAttr(attr, n == 0, n == nAttrs-1)
+		writeAttr(attr, n == nAttrs-1)
 		n++
 	}
 	r.Attrs(func(attr slog.Attr) bool {
-		writeAttr(attr, n == 0, n == nAttrs-1)
+		writeAttr(attr, n == nAttrs-1)
 		n++
 		return true
 	})
 	buf.WriteByte('\n')
 }
 
-// FormatSlogValue formats a slog.Value for serialization
-func FormatSlogValue(v slog.Value, term bool, tmp []byte) (result []byte) {
+// FormatSlogValue formats a slog.Value for serialization to terminal.
+func FormatSlogValue(v slog.Value, tmp []byte) (result []byte) {
 	var value any
 	defer func() {
 		if err := recover(); err != nil {
-			if v := reflect.ValueOf(value); v.Kind() == reflect.Ptr && v.IsNil() {
+			if v := reflect.ValueOf(value); v.Kind() == reflect.Pointer && v.IsNil() {
 				result = []byte("<nil>")
 			} else {
 				panic(err)
@@ -156,11 +134,9 @@ func FormatSlogValue(v slog.Value, term bool, tmp []byte) (result []byte) {
 	switch v.Kind() {
 	case slog.KindString:
 		return appendEscapeString(tmp, v.String())
-	case slog.KindAny:
-		value = v.Any()
-	case slog.KindInt64: // All int-types (int8 ,int16 etc) wind up here
+	case slog.KindInt64: // All int-types (int8, int16 etc) wind up here
 		return appendInt64(tmp, v.Int64())
-	case slog.KindUint64: // All uint-types (int8 ,int16 etc) wind up here
+	case slog.KindUint64: // All uint-types (uint8, uint16 etc) wind up here
 		return appendUint64(tmp, v.Uint64(), false)
 	case slog.KindFloat64:
 		return strconv.AppendFloat(tmp, v.Float64(), floatFormat, 3, 64)
@@ -180,27 +156,14 @@ func FormatSlogValue(v slog.Value, term bool, tmp []byte) (result []byte) {
 		return []byte("<nil>")
 	}
 	switch v := value.(type) {
-	case *big.Int:
-		// Big ints get consumed by the Stringer clause, so we need to handle
-		// them earlier on.
-		if v == nil {
-			return append(tmp, []byte("<nil>")...)
-		}
+	case *big.Int: // Need to be before fmt.Stringer-clause
 		return appendBigInt(tmp, v)
-
-	case *uint256.Int:
-		// Uint256s get consumed by the Stringer clause, so we need to handle
-		// them earlier on.
-		if v == nil {
-			return append(tmp, []byte("<nil>")...)
-		}
+	case *uint256.Int: // Need to be before fmt.Stringer-clause
 		return appendU256(tmp, v)
 	case error:
 		return appendEscapeString(tmp, v.Error())
 	case TerminalStringer:
-		if term {
-			return appendEscapeString(tmp, v.TerminalString()) // Custom terminal stringer provided, use that
-		}
+		return appendEscapeString(tmp, v.TerminalString())
 	case fmt.Stringer:
 		return appendEscapeString(tmp, v.String())
 	}
@@ -377,7 +340,7 @@ func writeTimeTermFormat(buf *bytes.Buffer, t time.Time) {
 
 // writePosIntWidth writes non-negative integer i to the buffer, padded on the left
 // by zeroes to the given width. Use a width of 0 to omit padding.
-// Adapted from golang.org/x/exp/slog/internal/buffer/buffer.go
+// Adapted from pkg.go.dev/log/slog/internal/buffer
 func writePosIntWidth(b *bytes.Buffer, i, width int) {
 	// Cheap integer to fixed-width decimal ASCII.
 	// Copied from log/log.go.

@@ -18,6 +18,7 @@ package p2p
 
 import (
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -31,12 +32,14 @@ const (
 	portMapRefreshInterval = 8 * time.Minute
 	portMapRetryInterval   = 5 * time.Minute
 	extipRetryInterval     = 2 * time.Minute
+	maxRetries             = 5 // max number of failed attempts to refresh the mapping
 )
 
 type portMapping struct {
 	protocol string
 	name     string
 	port     int
+	retries  int // number of failed attempts to refresh the mapping
 
 	// for use by the portMappingLoop goroutine:
 	extPort  int // the mapped port returned by the NAT interface
@@ -46,11 +49,11 @@ type portMapping struct {
 // setupPortMapping starts the port mapping loop if necessary.
 // Note: this needs to be called after the LocalNode instance has been set on the server.
 func (srv *Server) setupPortMapping() {
-	// portMappingRegister will receive up to two values: one for the TCP port if
-	// listening is enabled, and one more for enabling UDP port mapping if discovery is
-	// enabled. We make it buffered to avoid blocking setup while a mapping request is in
+	// portMappingRegister will receive up to three values: one for the TCP port if
+	// listening is enabled, one for the discovery UDP port, and one for the QUIC UDP
+	// port. We make it buffered to avoid blocking setup while a mapping request is in
 	// progress.
-	srv.portMappingRegister = make(chan *portMapping, 2)
+	srv.portMappingRegister = make(chan *portMapping, 3)
 
 	switch srv.NAT.(type) {
 	case nil:
@@ -91,7 +94,7 @@ func (srv *Server) portMappingLoop() {
 	}
 
 	var (
-		mappings  = make(map[string]*portMapping, 2)
+		mappings  = make(map[string]*portMapping, 3)
 		refresh   = mclock.NewAlarm(srv.clock)
 		extip     = mclock.NewAlarm(srv.clock)
 		lastExtIP net.IP
@@ -125,9 +128,9 @@ func (srv *Server) portMappingLoop() {
 			if err != nil {
 				log.Debug("Couldn't get external IP", "err", err, "interface", srv.NAT)
 			} else if !ip.Equal(lastExtIP) {
-				log.Debug("External IP changed", "ip", extip, "interface", srv.NAT)
+				log.Debug("External IP changed", "ip", ip, "interface", srv.NAT)
 			} else {
-				return
+				continue
 			}
 			// Here, we either failed to get the external IP, or it has changed.
 			lastExtIP = ip
@@ -141,7 +144,9 @@ func (srv *Server) portMappingLoop() {
 			if m.protocol != "TCP" && m.protocol != "UDP" {
 				panic("unknown NAT protocol name: " + m.protocol)
 			}
-			mappings[m.protocol] = m
+			// Key by protocol and port so multiple UDP mappings (discovery and QUIC)
+			// can coexist.
+			mappings[m.protocol+":"+strconv.Itoa(m.port)] = m
 			m.nextTime = srv.clock.Now()
 
 		case <-refresh.C():
@@ -150,37 +155,53 @@ func (srv *Server) portMappingLoop() {
 					continue
 				}
 
-				external := m.port
-				if m.extPort != 0 {
-					external = m.extPort
-				}
-				log := newLogger(m.protocol, external, m.port)
-
+				log := newLogger(m.protocol, m.extPort, m.port)
 				log.Trace("Attempting port mapping")
-				p, err := srv.NAT.AddMapping(m.protocol, external, m.port, m.name, portMapDuration)
+				p, err := srv.NAT.AddMapping(m.protocol, m.extPort, m.port, m.name, portMapDuration)
 				if err != nil {
-					log.Debug("Couldn't add port mapping", "err", err)
-					m.extPort = 0
+					// Failed to add or refresh port mapping.
+					if m.extPort == 0 {
+						log.Debug("Couldn't add port mapping", "err", err)
+					} else {
+						// Failed refresh. Since UPnP implementation are often buggy,
+						// and lifetime is larger than the retry interval, this does not
+						// mean we lost our existing mapping. We do not reset the external
+						// port, as it is still our best chance, but we do retry soon.
+						// We could check the error code, but UPnP implementations are buggy.
+						log.Debug("Couldn't refresh port mapping", "err", err)
+						m.retries++
+						if m.retries > maxRetries {
+							m.retries = 0
+							err := srv.NAT.DeleteMapping(m.protocol, m.extPort, m.port)
+							log.Debug("Couldn't refresh port mapping, trying to delete it:", "err", err)
+							m.extPort = 0
+						}
+					}
 					m.nextTime = srv.clock.Now().Add(portMapRetryInterval)
+					// Note ENR is not updated here, i.e. we keep the last port.
 					continue
 				}
-				// It was mapped!
-				m.extPort = int(p)
-				m.nextTime = srv.clock.Now().Add(portMapRefreshInterval)
-				if external != m.extPort {
-					log = newLogger(m.protocol, m.extPort, m.port)
-					log.Info("NAT mapped alternative port")
-				} else {
-					log.Info("NAT mapped port")
-				}
 
-				// Update port in local ENR.
-				switch m.protocol {
-				case "TCP":
-					srv.localnode.Set(enr.TCP(m.extPort))
-				case "UDP":
-					srv.localnode.SetFallbackUDP(m.extPort)
+				// It was mapped!
+				m.retries = 0
+				log = newLogger(m.protocol, int(p), m.port)
+				if int(p) != m.extPort {
+					m.extPort = int(p)
+					if m.port != m.extPort {
+						log.Info("NAT mapped alternative port")
+					} else {
+						log.Info("NAT mapped port")
+					}
+
+					// Update port in local ENR.
+					switch m.protocol {
+					case "TCP":
+						srv.localnode.Set(enr.TCP(m.extPort))
+					case "UDP":
+						srv.localnode.SetFallbackUDP(m.extPort)
+					}
 				}
+				m.nextTime = srv.clock.Now().Add(portMapRefreshInterval)
 			}
 		}
 	}

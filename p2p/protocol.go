@@ -17,6 +17,7 @@
 package p2p
 
 import (
+	"cmp"
 	"fmt"
 	"strings"
 
@@ -36,6 +37,9 @@ type Protocol struct {
 	// Length should contain the number of message codes used
 	// by the protocol.
 	Length uint64
+
+	// AllowBrowser indicates the protocol may run on anonymous browser connections.
+	AllowBrowser bool
 
 	// Run is called in a new goroutine when the protocol has been
 	// negotiated with a peer. It should read and write messages from
@@ -68,6 +72,17 @@ func (p Protocol) cap() Cap {
 	return Cap{p.Name, p.Version}
 }
 
+// filterProtocols returns the protocols where AllowBrowser matches.
+func filterProtocols(protos []Protocol, browser bool) []Protocol {
+	var allowed []Protocol
+	for _, p := range protos {
+		if p.AllowBrowser == browser {
+			allowed = append(allowed, p)
+		}
+	}
+	return allowed
+}
+
 // Cap is the structure of a peer capability.
 type Cap struct {
 	Name    string
@@ -81,13 +96,7 @@ func (cap Cap) String() string {
 // Cmp defines the canonical sorting order of capabilities.
 func (cap Cap) Cmp(other Cap) int {
 	if cap.Name == other.Name {
-		if cap.Version < other.Version {
-			return -1
-		}
-		if cap.Version > other.Version {
-			return 1
-		}
-		return 0
+		return cmp.Compare(cap.Version, other.Version)
 	}
 	return strings.Compare(cap.Name, other.Name)
 }

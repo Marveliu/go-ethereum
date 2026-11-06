@@ -30,10 +30,8 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/clique"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/exp/slog"
 )
 
 //go:generate go run github.com/fjl/gencodec -type header -field-override headerMarshaling -out gen_header.go
@@ -58,6 +56,9 @@ type header struct {
 	BlobGasUsed           *uint64           `json:"blobGasUsed"   rlp:"optional"`
 	ExcessBlobGas         *uint64           `json:"excessBlobGas"   rlp:"optional"`
 	ParentBeaconBlockRoot *common.Hash      `json:"parentBeaconBlockRoot" rlp:"optional"`
+	RequestsHash          *common.Hash      `json:"requestsHash" rlp:"optional"`
+	BlockAccessListHash   *common.Hash      `json:"blockAccessListHash" rlp:"optional"`
+	SlotNumber            *uint64           `json:"slotNumber" rlp:"optional"`
 }
 
 type headerMarshaling struct {
@@ -70,6 +71,7 @@ type headerMarshaling struct {
 	BaseFee       *math.HexOrDecimal256
 	BlobGasUsed   *math.HexOrDecimal64
 	ExcessBlobGas *math.HexOrDecimal64
+	SlotNumber    *math.HexOrDecimal64
 }
 
 type bbInput struct {
@@ -119,25 +121,28 @@ func (c *cliqueInput) UnmarshalJSON(input []byte) error {
 // ToBlock converts i into a *types.Block
 func (i *bbInput) ToBlock() *types.Block {
 	header := &types.Header{
-		ParentHash:       i.Header.ParentHash,
-		UncleHash:        types.EmptyUncleHash,
-		Coinbase:         common.Address{},
-		Root:             i.Header.Root,
-		TxHash:           types.EmptyTxsHash,
-		ReceiptHash:      types.EmptyReceiptsHash,
-		Bloom:            i.Header.Bloom,
-		Difficulty:       common.Big0,
-		Number:           i.Header.Number,
-		GasLimit:         i.Header.GasLimit,
-		GasUsed:          i.Header.GasUsed,
-		Time:             i.Header.Time,
-		Extra:            i.Header.Extra,
-		MixDigest:        i.Header.MixDigest,
-		BaseFee:          i.Header.BaseFee,
-		WithdrawalsHash:  i.Header.WithdrawalsHash,
-		BlobGasUsed:      i.Header.BlobGasUsed,
-		ExcessBlobGas:    i.Header.ExcessBlobGas,
-		ParentBeaconRoot: i.Header.ParentBeaconBlockRoot,
+		ParentHash:          i.Header.ParentHash,
+		UncleHash:           types.EmptyUncleHash,
+		Coinbase:            common.Address{},
+		Root:                i.Header.Root,
+		TxHash:              types.EmptyTxsHash,
+		ReceiptHash:         types.EmptyReceiptsHash,
+		Bloom:               i.Header.Bloom,
+		Difficulty:          common.Big0,
+		Number:              i.Header.Number,
+		GasLimit:            i.Header.GasLimit,
+		GasUsed:             i.Header.GasUsed,
+		Time:                i.Header.Time,
+		Extra:               i.Header.Extra,
+		MixDigest:           i.Header.MixDigest,
+		BaseFee:             i.Header.BaseFee,
+		WithdrawalsHash:     i.Header.WithdrawalsHash,
+		BlobGasUsed:         i.Header.BlobGasUsed,
+		ExcessBlobGas:       i.Header.ExcessBlobGas,
+		ParentBeaconRoot:    i.Header.ParentBeaconBlockRoot,
+		RequestsHash:        i.Header.RequestsHash,
+		BlockAccessListHash: i.Header.BlockAccessListHash,
+		SlotNumber:          i.Header.SlotNumber,
 	}
 
 	// Fill optional values.
@@ -162,7 +167,7 @@ func (i *bbInput) ToBlock() *types.Block {
 	if i.Header.Difficulty != nil {
 		header.Difficulty = i.Header.Difficulty
 	}
-	return types.NewBlockWithHeader(header).WithBody(i.Txs, i.Ommers).WithWithdrawals(i.Withdrawals)
+	return types.NewBlockWithHeader(header).WithBody(types.Body{Transactions: i.Txs, Uncles: i.Ommers, Withdrawals: i.Withdrawals})
 }
 
 // SealBlock seals the given block using the configured engine.
@@ -216,11 +221,6 @@ func (i *bbInput) sealClique(block *types.Block) (*types.Block, error) {
 
 // BuildBlock constructs a block from the given inputs.
 func BuildBlock(ctx *cli.Context) error {
-	// Configure the go-ethereum logger
-	glogger := log.NewGlogHandler(log.NewTerminalHandler(os.Stderr, false))
-	glogger.Verbosity(slog.Level(ctx.Int(VerbosityFlag.Name)))
-	log.SetDefault(log.NewLogger(glogger))
-
 	baseDir, err := createBasedir(ctx)
 	if err != nil {
 		return NewError(ErrorIO, fmt.Errorf("failed creating output basedir: %v", err))
@@ -249,7 +249,7 @@ func readInput(ctx *cli.Context) (*bbInput, error) {
 	if headerStr == stdinSelector || ommersStr == stdinSelector || txsStr == stdinSelector || cliqueStr == stdinSelector {
 		decoder := json.NewDecoder(os.Stdin)
 		if err := decoder.Decode(inputData); err != nil {
-			return nil, NewError(ErrorJson, fmt.Errorf("failed unmarshaling stdin: %v", err))
+			return nil, NewError(ErrorJson, fmt.Errorf("failed unmarshalling stdin: %v", err))
 		}
 	}
 	if cliqueStr != stdinSelector && cliqueStr != "" {

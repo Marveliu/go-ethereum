@@ -54,13 +54,12 @@ func newTestTransport(rpub *ecdsa.PublicKey, fd net.Conn, dialDest *ecdsa.Public
 	return &testTransport{rpub: rpub, rlpxTransport: wrapped}
 }
 
-func (c *testTransport) doEncHandshake(prv *ecdsa.PrivateKey) (*ecdsa.PublicKey, error) {
-	return c.rpub, nil
+func (c *testTransport) doEncHandshake(prv *ecdsa.PrivateKey) (*enode.Node, error) {
+	return enode.NewV4(c.rpub, nil, 0, 0), nil
 }
 
-func (c *testTransport) doProtoHandshake(our *protoHandshake) (*protoHandshake, error) {
-	pubkey := crypto.FromECDSAPub(c.rpub)[1:]
-	return &protoHandshake{ID: pubkey, Name: "test"}, nil
+func (c *testTransport) doProtoHandshake(our *devp2pProtocolHandshake) (transportHello, error) {
+	return transportHello{NodeID: hashPublicKeyV4(c.rpub), Name: "test"}, nil
 }
 
 func (c *testTransport) close(err error) {
@@ -317,8 +316,8 @@ func TestServerPeerLimits(t *testing.T) {
 
 	var tp = &setupTransport{
 		pubkey: &clientkey.PublicKey,
-		phs: protoHandshake{
-			ID: crypto.FromECDSAPub(&clientkey.PublicKey)[1:],
+		phs: transportHello{
+			NodeID: hashPublicKeyV4(&clientkey.PublicKey),
 			// Force "DiscUselessPeer" due to unmatching caps
 			// Caps: []Cap{discard.cap()},
 		},
@@ -403,27 +402,27 @@ func TestServerSetupConn(t *testing.T) {
 			wantCloseErr: errEncHandshakeError,
 		},
 		{
-			tt:           &setupTransport{pubkey: clientpub, phs: protoHandshake{ID: randomID().Bytes()}},
+			tt:           &setupTransport{pubkey: clientpub, phs: transportHello{NodeID: randomID()}},
 			dialDest:     enode.NewV4(clientpub, nil, 0, 0),
 			flags:        dynDialedConn,
 			wantCalls:    "doEncHandshake,doProtoHandshake,close,",
 			wantCloseErr: DiscUnexpectedIdentity,
 		},
 		{
-			tt:           &setupTransport{pubkey: clientpub, protoHandshakeErr: errProtoHandshakeError},
+			tt:           &setupTransport{pubkey: clientpub, protoHandshakeErr: DiscTooManyPeers},
 			dialDest:     enode.NewV4(clientpub, nil, 0, 0),
 			flags:        dynDialedConn,
 			wantCalls:    "doEncHandshake,doProtoHandshake,close,",
-			wantCloseErr: errProtoHandshakeError,
+			wantCloseErr: DiscTooManyPeers,
 		},
 		{
-			tt:           &setupTransport{pubkey: srvpub, phs: protoHandshake{ID: crypto.FromECDSAPub(srvpub)[1:]}},
+			tt:           &setupTransport{pubkey: srvpub, phs: transportHello{NodeID: hashPublicKeyV4(srvpub)}},
 			flags:        inboundConn,
 			wantCalls:    "doEncHandshake,close,",
 			wantCloseErr: DiscSelf,
 		},
 		{
-			tt:           &setupTransport{pubkey: clientpub, phs: protoHandshake{ID: crypto.FromECDSAPub(clientpub)[1:]}},
+			tt:           &setupTransport{pubkey: clientpub, phs: transportHello{NodeID: hashPublicKeyV4(clientpub)}},
 			flags:        inboundConn,
 			wantCalls:    "doEncHandshake,doProtoHandshake,close,",
 			wantCloseErr: DiscUselessPeer,
@@ -466,24 +465,27 @@ func TestServerSetupConn(t *testing.T) {
 type setupTransport struct {
 	pubkey            *ecdsa.PublicKey
 	encHandshakeErr   error
-	phs               protoHandshake
+	phs               transportHello
 	protoHandshakeErr error
 
 	calls    string
 	closeErr error
 }
 
-func (c *setupTransport) doEncHandshake(prv *ecdsa.PrivateKey) (*ecdsa.PublicKey, error) {
+func (c *setupTransport) doEncHandshake(prv *ecdsa.PrivateKey) (*enode.Node, error) {
 	c.calls += "doEncHandshake,"
-	return c.pubkey, c.encHandshakeErr
+	if c.encHandshakeErr != nil {
+		return nil, c.encHandshakeErr
+	}
+	return enode.NewV4(c.pubkey, nil, 0, 0), nil
 }
 
-func (c *setupTransport) doProtoHandshake(our *protoHandshake) (*protoHandshake, error) {
+func (c *setupTransport) doProtoHandshake(our *devp2pProtocolHandshake) (transportHello, error) {
 	c.calls += "doProtoHandshake,"
 	if c.protoHandshakeErr != nil {
-		return nil, c.protoHandshakeErr
+		return transportHello{}, c.protoHandshakeErr
 	}
-	return &c.phs, nil
+	return c.phs, nil
 }
 func (c *setupTransport) close(err error) {
 	c.calls += "close,"
@@ -577,6 +579,33 @@ func TestServerInboundThrottle(t *testing.T) {
 	case <-time.After(timeout):
 		t.Error("connection not closed within timeout")
 	}
+}
+
+func TestServerDiscoveryV5FailureRollsBackV4(t *testing.T) {
+	badBootstrap := enode.NewV4(&newkey().PublicKey, net.ParseIP("127.0.0.1"), 30303, 0) // invalid V5 of a V4 node
+	srv := &Server{
+		Config: Config{
+			PrivateKey:       newkey(),
+			ListenAddr:       "",
+			DiscAddr:         "127.0.0.1:0",
+			MaxPeers:         5,
+			DiscoveryV4:      true,
+			DiscoveryV5:      true,
+			BootstrapNodesV5: []*enode.Node{badBootstrap},
+			Logger:           testlog.Logger(t, log.LvlTrace),
+		},
+	}
+	err := srv.Start()
+	if err == nil {
+		t.Fatal("expected discovery v5 startup failure")
+	}
+	if !strings.Contains(err.Error(), "bad bootstrap node") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if srv.DiscoveryV4() != nil {
+		t.Fatal("discovery v4 not cleaned after failure")
+	}
+	srv.Stop()
 }
 
 func listenFakeAddr(network, laddr string, remoteAddr net.Addr) (net.Listener, error) {

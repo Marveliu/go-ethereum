@@ -21,13 +21,10 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"go/parser"
-	"go/token"
 	"io"
 	"log"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -40,14 +37,26 @@ var DryRunFlag = flag.Bool("n", false, "dry run, don't execute commands")
 // MustRun executes the given command and exits the host process for
 // any error.
 func MustRun(cmd *exec.Cmd) {
-	fmt.Println(">>>", printArgs(cmd.Args))
-	if !*DryRunFlag {
-		cmd.Stderr = os.Stderr
-		cmd.Stdout = os.Stdout
-		if err := cmd.Run(); err != nil {
-			log.Fatal(err)
-		}
+	if err := Run(cmd); err != nil {
+		log.Fatal(err)
 	}
+}
+
+// Run executes the command, echoing it first and streaming its output, and
+// returns any failure rather than terminating the process. Use it where a
+// failure should be collected and reported alongside the work that did
+// succeed; use MustRun where there is nothing sensible to continue with.
+func Run(cmd *exec.Cmd) error {
+	if cmd.Dir != "" && cmd.Dir != "." {
+		fmt.Printf("(in %s) ", cmd.Dir)
+	}
+	fmt.Println(">>>", printArgs(cmd.Args))
+	if *DryRunFlag {
+		return nil
+	}
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	return cmd.Run()
 }
 
 func printArgs(args []string) string {
@@ -66,6 +75,34 @@ func printArgs(args []string) string {
 
 func MustRunCommand(cmd string, args ...string) {
 	MustRun(exec.Command(cmd, args...))
+}
+
+// MustRunCommandWithOutput runs the given command, and ensures that some output will be
+// printed while it runs. This is useful for CI builds where the process will be stopped
+// when there is no output.
+func MustRunCommandWithOutput(cmd string, args ...string) {
+	MustRunWithOutput(exec.Command(cmd, args...))
+}
+
+// MustRunWithOutput runs the given command, and ensures that some output will be printed
+// while it runs. This is useful for CI builds where the process will be stopped when
+// there is no output.
+func MustRunWithOutput(cmd *exec.Cmd) {
+	interval := time.NewTicker(time.Minute)
+	done := make(chan struct{})
+	defer interval.Stop()
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-interval.C:
+				fmt.Printf("Waiting for command %q\n", cmd)
+			case <-done:
+				return
+			}
+		}
+	}()
+	MustRun(cmd)
 }
 
 var warnedAboutGit bool
@@ -89,9 +126,19 @@ func RunGit(args ...string) string {
 	return strings.TrimSpace(stdout.String())
 }
 
+// gitOutput runs a git subcommand and returns its output, or "" if git can't be
+// run or the command fails.
+func gitOutput(args ...string) string {
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // readGitFile returns content of file in .git directory.
 func readGitFile(file string) string {
-	content, err := os.ReadFile(path.Join(".git", file))
+	content, err := os.ReadFile(filepath.Join(".git", file))
 	if err != nil {
 		return ""
 	}
@@ -154,7 +201,7 @@ func UploadSFTP(identityFile, host, dir string, files []string) error {
 	}
 	in := io.MultiWriter(stdin, os.Stdout)
 	for _, f := range files {
-		fmt.Fprintln(in, "put", f, path.Join(dir, filepath.Base(f)))
+		fmt.Fprintln(in, "put", f, filepath.Join(dir, filepath.Base(f)))
 	}
 	fmt.Fprintln(in, "exit")
 	// Some issue with the PPA sftp server makes it so the server does not
@@ -189,28 +236,18 @@ func UploadSFTP(identityFile, host, dir string, files []string) error {
 
 // FindMainPackages finds all 'main' packages in the given directory and returns their
 // package paths.
-func FindMainPackages(dir string) []string {
-	var commands []string
-	cmds, err := os.ReadDir(dir)
+func FindMainPackages(tc *GoToolchain, pattern string) []string {
+	list := tc.Go("list", "-f", `{{if eq .Name "main"}}{{.ImportPath}}{{end}}`, pattern)
+	output, err := list.Output()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("go list failed:", err)
 	}
-	for _, cmd := range cmds {
-		pkgdir := filepath.Join(dir, cmd.Name())
-		if !cmd.IsDir() {
-			continue
-		}
-		pkgs, err := parser.ParseDir(token.NewFileSet(), pkgdir, nil, parser.PackageClauseOnly)
-		if err != nil {
-			log.Fatal(err)
-		}
-		for name := range pkgs {
-			if name == "main" {
-				path := "./" + filepath.ToSlash(pkgdir)
-				commands = append(commands, path)
-				break
-			}
+	var result []string
+	for l := range bytes.Lines(output) {
+		l = bytes.TrimSpace(l)
+		if len(l) > 0 {
+			result = append(result, string(l))
 		}
 	}
-	return commands
+	return result
 }

@@ -44,7 +44,7 @@ set to standard output. The following filters are supported:
 - `-limit <N>` limits the output set to N entries, taking the top N nodes by score
 - `-ip <CIDR>` filters nodes by IP subnet
 - `-min-age <duration>` filters nodes by 'first seen' time
-- `-eth-network <mainnet/goerli/sepolia/holesky>` filters nodes by "eth" ENR entry
+- `-eth-network <mainnet/sepolia/hoodi>` filters nodes by "eth" ENR entry
 - `-les-server` filters nodes by LES server support
 - `-snap` filters nodes by snap protocol support
 
@@ -80,6 +80,20 @@ Run `devp2p discv5 listen` to run a Discovery v5 node.
 Run `devp2p discv5 crawl <nodes.json path>` to create or update a JSON node set containing
 discv5 nodes.
 
+### Combined Discovery
+
+Run `devp2p discovery listen` to run a node speaking all supported discovery protocol
+versions (currently discv4 and discv5) on a single UDP port. For a single-protocol node, use
+`devp2p discv4 listen` or `devp2p discv5 listen`. Add `--rpc <addr>` to expose the
+per-protocol HTTP API (`discv4_*`, `discv5_*`).
+
+Add the global `--metrics` flag to any listen command to collect metrics. They are served
+at `/debug/metrics/prometheus` (and `/debug/metrics` as expvar JSON) on
+`--metrics.addr`:`--metrics.port`, default `127.0.0.1:6060`. The `discover/*` series
+report table size per bucket, bytes in and out, received packets per message type, and
+dropped packets per protocol version. The `--metrics.influxdb*` flags also work and push the
+same series to InfluxDB, under the `geth.` prefix.
+
 ### Discovery Test Suites
 
 The devp2p command also contains interactive test suites for Discovery v4 and Discovery
@@ -108,31 +122,32 @@ Start the test by running `devp2p discv5 test -listen1 127.0.0.1 -listen2 127.0.
 
 The Eth Protocol test suite is a conformance test suite for the [eth protocol][eth].
 
-To run the eth protocol test suite against your implementation, the node needs to be initialized as such:
+To run the eth protocol test suite against your implementation, the node needs to be initialized
+with our test chain. The chain files are located in `./cmd/devp2p/internal/ethtest/testdata`.
 
-1. initialize the geth node with the `genesis.json` file contained in the `testdata` directory
-2. import the `halfchain.rlp` file in the `testdata` directory
-3. run geth with the following flags:
-```
-geth --datadir <datadir> --nodiscover --nat=none --networkid 19763 --verbosity 5
-```
+1. initialize the geth node with the `genesis.json` file
+2. import blocks from `chain.rlp`
+3. run the client using the resulting database. For geth, use a command like the one below:
 
-Then, run the following command, replacing `<enode>` with the enode of the geth node:
- ```
- devp2p rlpx eth-test <enode> cmd/devp2p/internal/ethtest/testdata/chain.rlp cmd/devp2p/internal/ethtest/testdata/genesis.json
-```
+    geth \
+        --datadir <datadir>            \
+        --nodiscover                   \
+        --nat=none                     \
+        --networkid 3503995874084926   \
+        --verbosity 5                  \
+        --authrpc.jwtsecret jwt.secret
+
+Note that the tests also require access to the engine API.
+The test suite can now be executed using the devp2p tool.
+
+    devp2p rlpx eth-test \
+        --chain internal/ethtest/testdata   \
+        --node enode://....                 \
+        --engineapi http://127.0.0.1:8551   \
+        --jwtsecret $(cat jwt.secret)
 
 Repeat the above process (re-initialising the node) in order to run the Eth Protocol test suite again.
 
-#### Eth66 Test Suite
-
-The Eth66 test suite is also a conformance test suite for the eth 66 protocol version specifically.
-To run the eth66 protocol test suite, initialize a geth node as described above and run the following command,
-replacing `<enode>` with the enode of the geth node:
-
- ```
- devp2p rlpx eth66-test <enode> cmd/devp2p/internal/ethtest/testdata/chain.rlp cmd/devp2p/internal/ethtest/testdata/genesis.json
-```
 
 [eth]: https://github.com/ethereum/devp2p/blob/master/caps/eth.md
 [dns-tutorial]: https://geth.ethereum.org/docs/developers/geth-developer/dns-discovery-setup

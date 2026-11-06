@@ -30,7 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/core/bloombits"
+	"github.com/ethereum/go-ethereum/core/filtermaps"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -42,70 +42,88 @@ import (
 
 // TestSetFeeDefaults tests the logic for filling in default fee values works as expected.
 func TestSetFeeDefaults(t *testing.T) {
+	t.Parallel()
+
 	type test struct {
-		name     string
-		isLondon bool
-		in       *TransactionArgs
-		want     *TransactionArgs
-		err      error
+		name string
+		fork string // options: legacy, london, cancun
+		in   *TransactionArgs
+		want *TransactionArgs
+		err  error
 	}
 
 	var (
 		b        = newBackendMock()
+		zero     = (*hexutil.Big)(big.NewInt(0))
 		fortytwo = (*hexutil.Big)(big.NewInt(42))
 		maxFee   = (*hexutil.Big)(new(big.Int).Add(new(big.Int).Mul(b.current.BaseFee, big.NewInt(2)), fortytwo.ToInt()))
 		al       = &types.AccessList{types.AccessTuple{Address: common.Address{0xaa}, StorageKeys: []common.Hash{{0x01}}}}
+		authList = []types.SetCodeAuthorization{{Address: common.Address{0xbb}}}
 	)
 
 	tests := []test{
 		// Legacy txs
 		{
 			"legacy tx pre-London",
-			false,
+			"legacy",
 			&TransactionArgs{},
 			&TransactionArgs{GasPrice: fortytwo},
 			nil,
 		},
 		{
+			"legacy tx pre-London with zero price",
+			"legacy",
+			&TransactionArgs{GasPrice: zero},
+			&TransactionArgs{GasPrice: zero},
+			nil,
+		},
+		{
 			"legacy tx post-London, explicit gas price",
-			true,
+			"london",
 			&TransactionArgs{GasPrice: fortytwo},
 			&TransactionArgs{GasPrice: fortytwo},
 			nil,
+		},
+		{
+			"legacy tx post-London with zero price",
+			"london",
+			&TransactionArgs{GasPrice: zero},
+			nil,
+			errors.New("gasPrice must be non-zero after london fork"),
 		},
 
 		// Access list txs
 		{
 			"access list tx pre-London",
-			false,
+			"legacy",
 			&TransactionArgs{AccessList: al},
 			&TransactionArgs{AccessList: al, GasPrice: fortytwo},
 			nil,
 		},
 		{
 			"access list tx post-London, explicit gas price",
-			false,
+			"legacy",
 			&TransactionArgs{AccessList: al, GasPrice: fortytwo},
 			&TransactionArgs{AccessList: al, GasPrice: fortytwo},
 			nil,
 		},
 		{
 			"access list tx post-London",
-			true,
+			"london",
 			&TransactionArgs{AccessList: al},
 			&TransactionArgs{AccessList: al, MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
 			nil,
 		},
 		{
 			"access list tx post-London, only max fee",
-			true,
+			"london",
 			&TransactionArgs{AccessList: al, MaxFeePerGas: maxFee},
 			&TransactionArgs{AccessList: al, MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
 			nil,
 		},
 		{
 			"access list tx post-London, only priority fee",
-			true,
+			"london",
 			&TransactionArgs{AccessList: al, MaxFeePerGas: maxFee},
 			&TransactionArgs{AccessList: al, MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
 			nil,
@@ -114,96 +132,286 @@ func TestSetFeeDefaults(t *testing.T) {
 		// Dynamic fee txs
 		{
 			"dynamic tx post-London",
-			true,
+			"london",
 			&TransactionArgs{},
 			&TransactionArgs{MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
 			nil,
 		},
 		{
 			"dynamic tx post-London, only max fee",
-			true,
+			"london",
 			&TransactionArgs{MaxFeePerGas: maxFee},
 			&TransactionArgs{MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
 			nil,
 		},
 		{
 			"dynamic tx post-London, only priority fee",
-			true,
+			"london",
 			&TransactionArgs{MaxFeePerGas: maxFee},
 			&TransactionArgs{MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
 			nil,
 		},
 		{
 			"dynamic fee tx pre-London, maxFee set",
-			false,
+			"legacy",
 			&TransactionArgs{MaxFeePerGas: maxFee},
 			nil,
 			errors.New("maxFeePerGas and maxPriorityFeePerGas are not valid before London is active"),
 		},
 		{
 			"dynamic fee tx pre-London, priorityFee set",
-			false,
+			"legacy",
 			&TransactionArgs{MaxPriorityFeePerGas: fortytwo},
 			nil,
 			errors.New("maxFeePerGas and maxPriorityFeePerGas are not valid before London is active"),
 		},
 		{
 			"dynamic fee tx, maxFee < priorityFee",
-			true,
+			"london",
 			&TransactionArgs{MaxFeePerGas: maxFee, MaxPriorityFeePerGas: (*hexutil.Big)(big.NewInt(1000))},
 			nil,
 			errors.New("maxFeePerGas (0x3e) < maxPriorityFeePerGas (0x3e8)"),
 		},
 		{
 			"dynamic fee tx, maxFee < priorityFee while setting default",
-			true,
+			"london",
 			&TransactionArgs{MaxFeePerGas: (*hexutil.Big)(big.NewInt(7))},
 			nil,
 			errors.New("maxFeePerGas (0x7) < maxPriorityFeePerGas (0x2a)"),
+		},
+		{
+			"dynamic fee tx post-London, explicit gas price",
+			"london",
+			&TransactionArgs{MaxFeePerGas: zero, MaxPriorityFeePerGas: zero},
+			nil,
+			errors.New("maxFeePerGas must be non-zero"),
 		},
 
 		// Misc
 		{
 			"set all fee parameters",
-			false,
+			"legacy",
 			&TransactionArgs{GasPrice: fortytwo, MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
 			nil,
 			errors.New("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
 		},
 		{
 			"set gas price and maxPriorityFee",
-			false,
+			"legacy",
 			&TransactionArgs{GasPrice: fortytwo, MaxPriorityFeePerGas: fortytwo},
 			nil,
 			errors.New("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
 		},
 		{
 			"set gas price and maxFee",
-			true,
+			"london",
 			&TransactionArgs{GasPrice: fortytwo, MaxFeePerGas: maxFee},
 			nil,
 			errors.New("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
+		},
+		{
+			"set gas price and authorization list",
+			"london",
+			&TransactionArgs{GasPrice: fortytwo, AuthorizationList: authList},
+			nil,
+			errors.New("both gasPrice and authorizationList specified"),
+		},
+		// EIP-4844
+		{
+			"set gas price and maxFee for blob transaction",
+			"cancun",
+			&TransactionArgs{GasPrice: fortytwo, MaxFeePerGas: maxFee, BlobHashes: []common.Hash{}},
+			nil,
+			errors.New("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
+		},
+		{
+			"fill maxFeePerBlobGas",
+			"cancun",
+			&TransactionArgs{BlobHashes: []common.Hash{}},
+			&TransactionArgs{BlobHashes: []common.Hash{}, BlobFeeCap: (*hexutil.Big)(big.NewInt(4)), MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
+			nil,
+		},
+		{
+			"fill maxFeePerBlobGas when dynamic fees are set",
+			"cancun",
+			&TransactionArgs{BlobHashes: []common.Hash{}, MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
+			&TransactionArgs{BlobHashes: []common.Hash{}, BlobFeeCap: (*hexutil.Big)(big.NewInt(4)), MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
+			nil,
 		},
 	}
 
 	ctx := context.Background()
 	for i, test := range tests {
-		if test.isLondon {
-			b.activateLondon()
-		} else {
-			b.deactivateLondon()
+		if err := b.setFork(test.fork); err != nil {
+			t.Fatalf("failed to set fork: %v", err)
 		}
 		got := test.in
-		err := got.setFeeDefaults(ctx, b)
-		if err != nil && err.Error() == test.err.Error() {
-			// Test threw expected error.
+		err := got.setFeeDefaults(ctx, b, b.CurrentHeader())
+		if err != nil {
+			if test.err == nil {
+				t.Fatalf("test %d (%s): unexpected error: %s", i, test.name, err)
+			} else if err.Error() != test.err.Error() {
+				t.Fatalf("test %d (%s): unexpected error: (got: %s, want: %s)", i, test.name, err, test.err)
+			}
+			// Matching error.
 			continue
-		} else if err != nil {
-			t.Fatalf("test %d (%s): unexpected error: %s", i, test.name, err)
+		} else if test.err != nil {
+			t.Fatalf("test %d (%s): expected error: %s", i, test.name, test.err)
 		}
 		if !reflect.DeepEqual(got, test.want) {
 			t.Fatalf("test %d (%s): did not fill defaults as expected: (got: %v, want: %v)", i, test.name, got, test.want)
 		}
+	}
+}
+
+// TestCallDefaults tests that CallDefaults rejects transaction types that
+// cannot be represented without a recipient, instead of letting ToTransaction
+// dereference the nil "to" field later on.
+func TestCallDefaults(t *testing.T) {
+	t.Parallel()
+
+	var (
+		addr    = common.Address{0x42}
+		baseFee = big.NewInt(params.InitialBaseFee)
+		chainID = big.NewInt(1)
+	)
+	tests := []struct {
+		name string
+		args TransactionArgs
+		err  error
+	}{
+		{
+			name: "authorization list without to",
+			args: TransactionArgs{AuthorizationList: []types.SetCodeAuthorization{{Address: addr}}},
+			err:  core.ErrSetCodeTxCreate,
+		},
+		{
+			name: "empty authorization list without to",
+			args: TransactionArgs{AuthorizationList: []types.SetCodeAuthorization{}},
+			err:  core.ErrSetCodeTxCreate,
+		},
+		{
+			name: "blob hashes without to",
+			args: TransactionArgs{BlobHashes: []common.Hash{{0x01}}},
+			err:  core.ErrBlobTxCreate,
+		},
+		{
+			name: "plain contract creation",
+			args: TransactionArgs{},
+		},
+		{
+			name: "authorization list with to",
+			args: TransactionArgs{To: &addr, AuthorizationList: []types.SetCodeAuthorization{{Address: addr}}},
+		},
+		{
+			name: "blob hashes with to",
+			args: TransactionArgs{To: &addr, BlobHashes: []common.Hash{{0x01}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.args.CallDefaults(0, baseFee, chainID)
+			if tt.err == nil {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				// Sanitized args must be representable as a transaction, as
+				// eth_simulateV1 and debug_traceCall convert them after this.
+				tt.args.ToTransaction(types.DynamicFeeTxType)
+			} else if !errors.Is(err, tt.err) {
+				t.Fatalf("error mismatch, want %q, have %v", tt.err, err)
+			}
+		})
+	}
+}
+
+// TestCallDefaultsPreLondon tests that CallDefaults rejects EIP-1559 fee
+// fields when the block has no base fee, instead of silently dropping them.
+func TestCallDefaultsPreLondon(t *testing.T) {
+	t.Parallel()
+
+	zero := new(hexutil.Big)
+	tests := []struct {
+		name string
+		args TransactionArgs
+		fail bool
+	}{
+		{name: "no fee fields"},
+		{name: "gasPrice", args: TransactionArgs{GasPrice: zero}},
+		{name: "maxFeePerGas", args: TransactionArgs{MaxFeePerGas: zero}, fail: true},
+		{name: "maxPriorityFeePerGas", args: TransactionArgs{MaxPriorityFeePerGas: zero}, fail: true},
+		{name: "both fee fields", args: TransactionArgs{MaxFeePerGas: zero, MaxPriorityFeePerGas: zero}, fail: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.args.CallDefaults(0, nil, big.NewInt(1))
+			if (err != nil) != tt.fail {
+				t.Fatalf("error mismatch, want fail=%v, have %v", tt.fail, err)
+			}
+		})
+	}
+}
+
+// TestSetDefaultsEmptyAuthList tests that setDefaults rejects an authorization
+// list on a contract creation even when the list is empty, as ToTransaction
+// cannot represent it.
+func TestSetDefaultsEmptyAuthList(t *testing.T) {
+	t.Parallel()
+
+	var (
+		b    = newBackendMock()
+		gas  = hexutil.Uint64(100000)
+		data = hexutil.Bytes{0x01}
+	)
+	args := &TransactionArgs{
+		MaxFeePerGas:         (*hexutil.Big)(big.NewInt(42)),
+		MaxPriorityFeePerGas: (*hexutil.Big)(big.NewInt(42)),
+		Gas:                  &gas,
+		Data:                 &data,
+		AuthorizationList:    []types.SetCodeAuthorization{},
+	}
+	want := `authorizationList provided for contract creation, but "to" field is missing`
+	if err := args.setDefaults(context.Background(), b, sidecarConfig{}); err == nil || err.Error() != want {
+		t.Fatalf("error mismatch, want %q, have %v", want, err)
+	}
+}
+
+func TestToTransactionGasPriceAccessList(t *testing.T) {
+	gas, nonce := hexutil.Uint64(50000), hexutil.Uint64(0)
+	al := types.AccessList{{Address: common.Address{0xaa}}}
+	args := &TransactionArgs{
+		Gas:        &gas,
+		Nonce:      &nonce,
+		Value:      new(hexutil.Big),
+		GasPrice:   (*hexutil.Big)(big.NewInt(1)),
+		ChainID:    (*hexutil.Big)(big.NewInt(1)),
+		AccessList: &al,
+	}
+	tx := args.ToTransaction(types.DynamicFeeTxType)
+	if tx.Type() != types.AccessListTxType || len(tx.AccessList()) != 1 {
+		t.Fatalf("want access list tx, have type %d with access list %v", tx.Type(), tx.AccessList())
+	}
+}
+
+// TestSetDefaultsInvalidAuthYParity tests that setDefaults rejects an
+// authorization whose yParity is not 0 or 1.
+func TestSetDefaultsInvalidAuthYParity(t *testing.T) {
+	t.Parallel()
+
+	var (
+		b    = newBackendMock()
+		gas  = hexutil.Uint64(100000)
+		addr = common.Address{0x42}
+	)
+	args := &TransactionArgs{
+		To:                   &addr,
+		MaxFeePerGas:         (*hexutil.Big)(big.NewInt(42)),
+		MaxPriorityFeePerGas: (*hexutil.Big)(big.NewInt(42)),
+		Gas:                  &gas,
+		AuthorizationList:    []types.SetCodeAuthorization{{Address: addr, V: 2}},
+	}
+	if err := args.setDefaults(context.Background(), b, sidecarConfig{}); !errors.Is(err, types.ErrInvalidYParity) {
+		t.Fatalf("error mismatch, want %v, have %v", types.ErrInvalidYParity, err)
 	}
 }
 
@@ -213,6 +421,7 @@ type backendMock struct {
 }
 
 func newBackendMock() *backendMock {
+	var cancunTime uint64 = 600
 	config := &params.ChainConfig{
 		ChainID:             big.NewInt(42),
 		HomesteadBlock:      big.NewInt(0),
@@ -228,6 +437,8 @@ func newBackendMock() *backendMock {
 		MuirGlacierBlock:    big.NewInt(0),
 		BerlinBlock:         big.NewInt(0),
 		LondonBlock:         big.NewInt(1000),
+		CancunTime:          &cancunTime,
+		BlobScheduleConfig:  params.DefaultBlobSchedule,
 	}
 	return &backendMock{
 		current: &types.Header{
@@ -243,23 +454,40 @@ func newBackendMock() *backendMock {
 	}
 }
 
-func (b *backendMock) activateLondon() {
-	b.current.Number = big.NewInt(1100)
+func (b *backendMock) setFork(fork string) error {
+	if fork == "legacy" {
+		b.current.Number = big.NewInt(900)
+		b.current.Time = 555
+	} else if fork == "london" {
+		b.current.Number = big.NewInt(1100)
+		b.current.Time = 555
+	} else if fork == "cancun" {
+		b.current.Number = big.NewInt(1100)
+		b.current.Time = 700
+		// Blob base fee will be 2
+		excess := uint64(2314058)
+		b.current.ExcessBlobGas = &excess
+	} else {
+		return errors.New("invalid fork")
+	}
+	return nil
 }
 
-func (b *backendMock) deactivateLondon() {
-	b.current.Number = big.NewInt(900)
-}
 func (b *backendMock) SuggestGasTipCap(ctx context.Context) (*big.Int, error) {
 	return big.NewInt(42), nil
 }
+func (b *backendMock) BlobBaseFee(ctx context.Context) *big.Int { return big.NewInt(42) }
+func (b *backendMock) BaseFee(ctx context.Context) *big.Int     { return big.NewInt(42) }
+
 func (b *backendMock) CurrentHeader() *types.Header     { return b.current }
 func (b *backendMock) ChainConfig() *params.ChainConfig { return b.config }
 
 // Other methods needed to implement Backend interface.
-func (b *backendMock) SyncProgress() ethereum.SyncProgress { return ethereum.SyncProgress{} }
-func (b *backendMock) FeeHistory(ctx context.Context, blockCount uint64, lastBlock rpc.BlockNumber, rewardPercentiles []float64) (*big.Int, [][]*big.Int, []*big.Int, []float64, error) {
-	return nil, nil, nil, nil, nil
+func (b *backendMock) SyncProgress(ctx context.Context) ethereum.SyncProgress {
+	return ethereum.SyncProgress{}
+}
+func (b *backendMock) FeeHistory(ctx context.Context, blockCount uint64, lastBlock rpc.BlockNumber, rewardPercentiles []float64) (*big.Int, [][]*big.Int, []*big.Int, []float64, []*big.Int, []float64, error) {
+	return nil, nil, nil, nil, nil, nil, nil
 }
 func (b *backendMock) ChainDb() ethdb.Database           { return nil }
 func (b *backendMock) AccountManager() *accounts.Manager { return nil }
@@ -268,7 +496,7 @@ func (b *backendMock) RPCGasCap() uint64                 { return 0 }
 func (b *backendMock) RPCEVMTimeout() time.Duration      { return time.Second }
 func (b *backendMock) RPCTxFeeCap() float64              { return 0 }
 func (b *backendMock) UnprotectedAllowed() bool          { return false }
-func (b *backendMock) SetHead(number uint64)             {}
+func (b *backendMock) SetHead(number uint64) error       { return nil }
 func (b *backendMock) HeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Header, error) {
 	return nil, nil
 }
@@ -297,28 +525,28 @@ func (b *backendMock) StateAndHeaderByNumber(ctx context.Context, number rpc.Blo
 func (b *backendMock) StateAndHeaderByNumberOrHash(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*state.StateDB, *types.Header, error) {
 	return nil, nil, nil
 }
-func (b *backendMock) PendingBlockAndReceipts() (*types.Block, types.Receipts) { return nil, nil }
+func (b *backendMock) Pending() (*types.Block, types.Receipts, *state.StateDB) { return nil, nil, nil }
 func (b *backendMock) GetReceipts(ctx context.Context, hash common.Hash) (types.Receipts, error) {
+	return nil, nil
+}
+func (b *backendMock) GetCanonicalReceipt(tx *types.Transaction, blockHash common.Hash, blockNumber, blockIndex uint64) (*types.Receipt, error) {
 	return nil, nil
 }
 func (b *backendMock) GetLogs(ctx context.Context, blockHash common.Hash, number uint64) ([][]*types.Log, error) {
 	return nil, nil
 }
-func (b *backendMock) GetTd(ctx context.Context, hash common.Hash) *big.Int { return nil }
-func (b *backendMock) GetEVM(ctx context.Context, msg *core.Message, state *state.StateDB, header *types.Header, vmConfig *vm.Config, blockCtx *vm.BlockContext) *vm.EVM {
+func (b *backendMock) GetEVM(ctx context.Context, state *state.StateDB, header *types.Header, vmConfig *vm.Config, blockCtx *vm.BlockContext) *vm.EVM {
 	return nil
 }
 func (b *backendMock) SubscribeChainEvent(ch chan<- core.ChainEvent) event.Subscription { return nil }
 func (b *backendMock) SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription {
 	return nil
 }
-func (b *backendMock) SubscribeChainSideEvent(ch chan<- core.ChainSideEvent) event.Subscription {
-	return nil
-}
 func (b *backendMock) SendTx(ctx context.Context, signedTx *types.Transaction) error { return nil }
-func (b *backendMock) GetTransaction(ctx context.Context, txHash common.Hash) (*types.Transaction, common.Hash, uint64, uint64, error) {
-	return nil, [32]byte{}, 0, 0, nil
+func (b *backendMock) GetCanonicalTransaction(txHash common.Hash) (bool, *types.Transaction, common.Hash, uint64, uint64) {
+	return false, nil, [32]byte{}, 0, 0
 }
+func (b *backendMock) TxIndexDone() bool                                        { return true }
 func (b *backendMock) GetPoolTransactions() (types.Transactions, error)         { return nil, nil }
 func (b *backendMock) GetPoolTransaction(txHash common.Hash) *types.Transaction { return nil }
 func (b *backendMock) GetPoolNonce(ctx context.Context, addr common.Address) (uint64, error) {
@@ -331,15 +559,16 @@ func (b *backendMock) TxPoolContent() (map[common.Address][]*types.Transaction, 
 func (b *backendMock) TxPoolContentFrom(addr common.Address) ([]*types.Transaction, []*types.Transaction) {
 	return nil, nil
 }
-func (b *backendMock) SubscribeNewTxsEvent(chan<- core.NewTxsEvent) event.Subscription      { return nil }
-func (b *backendMock) BloomStatus() (uint64, uint64)                                        { return 0, 0 }
-func (b *backendMock) ServiceFilter(ctx context.Context, session *bloombits.MatcherSession) {}
-func (b *backendMock) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscription         { return nil }
-func (b *backendMock) SubscribePendingLogsEvent(ch chan<- []*types.Log) event.Subscription {
-	return nil
-}
+func (b *backendMock) SubscribeNewTxsEvent(chan<- core.NewTxsEvent) event.Subscription { return nil }
+func (b *backendMock) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscription    { return nil }
 func (b *backendMock) SubscribeRemovedLogsEvent(ch chan<- core.RemovedLogsEvent) event.Subscription {
 	return nil
 }
 
 func (b *backendMock) Engine() consensus.Engine { return nil }
+
+func (b *backendMock) CurrentView() *filtermaps.ChainView           { return nil }
+func (b *backendMock) NewMatcherBackend() filtermaps.MatcherBackend { return nil }
+
+func (b *backendMock) HistoryPruningCutoff() uint64       { return 0 }
+func (b *backendMock) HistoryRetention() HistoryRetention { return HistoryRetention{} }
